@@ -1,0 +1,16 @@
+body::before {
+    content: "";
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    background-image: url('./custom-background.png');
+    background-size: contain;
+    background-repeat: no-repeat;
+    background-position: center;
+    background-attachment: fixed;
+    opacity: 0.1; /* Adjust the opacity to achieve the desired fade effect */
+    z-index: -1;
+  }
+  
