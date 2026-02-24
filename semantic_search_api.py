@@ -1,5 +1,21 @@
 import os
 import google.generativeai as genai
+
+# Try to import OpenAI with version compatibility
+try:
+    from openai import OpenAI  # openai >= 1.0.0
+    OPENAI_VERSION = "new"
+    print("new openai")
+except ImportError:
+    try:
+        import openai  # openai < 1.0.0
+        OPENAI_VERSION = "old"
+        print("old openai")
+    except ImportError:
+        openai = None
+        OPENAI_VERSION = None
+        print("no openai")
+
 from flask import Flask, request, jsonify, Response, stream_with_context
 from flask_cors import CORS, cross_origin
 from neo4j import GraphDatabase
@@ -13,7 +29,7 @@ import threading
 from queue import Queue
 import json
 import time
-from sentence_transformers import SentenceTransformer
+from sentence_transformers import SentenceTransformer, CrossEncoder
 import tempfile
 from create_graph import (
     Neo4jBatchImporter, 
@@ -23,6 +39,343 @@ from create_graph import (
 from gen_embeddings import EnhancedKGEmbeddings
 from create_graph_rdf import process_file_in_batches as process_rdf_file
 from gen_embeddings_rdf import generate_and_store_embeddings
+from neomodel import config as neomodel_config, db as neomodel_db
+
+import httpx
+
+
+def get_graph_schema():
+    with driver.session() as session:
+        nodes_query = "CALL db.schema.nodeTypeProperties()"
+        rels_query = "CALL db.schema.relTypeProperties()"
+        nodes = session.run(nodes_query).data()
+        rels = session.run(rels_query).data()
+
+    node_schema = {}
+    for n in nodes:
+        label = n["nodeType"]
+        prop = n["propertyName"]
+        if label not in node_schema:
+            node_schema[label] = set()
+        node_schema[label].add(prop)
+
+    rel_schema = {}
+    for r in rels:
+        # Different Neo4j versions / procedures may expose different key names.
+        # Collect safe fallbacks.
+        rel_type = r.get("relType") or r.get("relationshipType") or r.get("relationship")
+        start = r.get("sourceNodeType") or r.get("from") or r.get("startNodeType")
+        end = r.get("targetNodeType") or r.get("to") or r.get("endNodeType")
+        if not rel_type:
+            # Skip rows we can't interpret
+            continue
+        if rel_type not in rel_schema:
+            rel_schema[rel_type] = []
+        rel_schema[rel_type].append((start, end))
+
+    return {
+        "nodes": {k: list(v) for k, v in node_schema.items()},
+        "relationships": rel_schema
+    }
+
+def generate_structured_cypher_query(schema: dict, similarity_threshold: float = 0.5, n_results: int = 15) -> str:
+    """Generate a structured Cypher query based on the graph schema that includes connected models."""
+    if not schema or not schema.get("nodes"):
+        # Fallback to basic embedding query
+        return """
+        MATCH (n)
+        WITH n,
+            CASE
+                WHEN 'embedding' IN keys(n) THEN n.embedding
+                ELSE head([k IN keys(n) WHERE toLower(k) CONTAINS 'embedding' | n[k]])
+            END AS emb
+        WHERE emb IS NOT NULL AND size(emb) = size($embedding)
+        WITH n, emb,
+            REDUCE(dot = 0.0, i IN RANGE(0, size(emb)-1) | dot + emb[i] * $embedding[i]) AS dot,
+            SQRT(REDUCE(n1 = 0.0, i IN RANGE(0, size(emb)-1) | n1 + emb[i]*emb[i])) AS n1,
+            SQRT(REDUCE(n2 = 0.0, i IN RANGE(0, size($embedding)-1) | n2 + $embedding[i]*$embedding[i])) AS n2
+        WITH n, CASE WHEN n1 = 0 OR n2 = 0 THEN 0.0 ELSE dot / (n1 * n2) END AS similarity
+        WHERE similarity > $similarity_threshold
+        RETURN n, similarity
+        ORDER BY similarity DESC
+        LIMIT $n
+        """
+    
+    nodes = schema.get("nodes", {})
+    relationships = schema.get("relationships", {})
+    
+    # Find the primary entity nodes (those that have embedding properties)
+    primary_nodes = []
+    for node_type, properties in nodes.items():
+        if "embedding" in properties:
+            # Clean node type (remove `: ` prefix if present)
+            clean_type = node_type.replace(":`", "").replace("`", "").strip(":")
+            primary_nodes.append(clean_type)
+    
+    if not primary_nodes:
+        # No embedding-enabled nodes found, use fallback
+        return generate_structured_cypher_query({}, similarity_threshold, n_results)
+    
+    # Use the first primary node as the main entity (usually Asset in AAS graphs)
+    main_entity = primary_nodes[0]
+    main_var = main_entity.lower()[0]  # 'a' for Asset, etc.
+    
+    # Build the base query with embedding similarity
+    query_parts = [
+        f"MATCH ({main_var}:{main_entity})",
+        f"WHERE {main_var}.embedding IS NOT NULL",
+        f"WITH {main_var},",
+        f"REDUCE(dot = 0.0, i IN RANGE(0, SIZE({main_var}.embedding)-1) |",
+        f"    dot + {main_var}.embedding[i] * $embedding[i]",
+        f") / (",
+        f"    SQRT(REDUCE(norm1 = 0.0, i IN RANGE(0, SIZE({main_var}.embedding)-1) |",
+        f"        norm1 + {main_var}.embedding[i] * {main_var}.embedding[i]",
+        f"    )) *",
+        f"    SQRT(REDUCE(norm2 = 0.0, i IN RANGE(0, SIZE($embedding)-1) |",
+        f"        norm2 + $embedding[i] * $embedding[i]",
+        f"    ))",
+        f") AS similarity",
+        f"WHERE similarity > {similarity_threshold}",
+        ""
+    ]
+    
+    # Add optional matches for relationships and connected entities
+    optional_matches = []
+    return_fields = []
+    collect_parts = []
+    
+    # First add properties of main entity
+    main_entity_key = None
+    for key in nodes.keys():
+        if main_entity in key:
+            main_entity_key = key
+            break
+    
+    if main_entity_key:
+        main_props = nodes.get(main_entity_key, [])
+        for prop in main_props:
+            if prop != "embedding":  # Skip embedding property
+                return_fields.append(f"{main_var}.{prop} AS {prop}")
+    
+    # Add similarity score
+    return_fields.append("similarity AS score")
+    
+    # Process relationships to find connected entities
+    model_relationships = []  # For HAS_MODEL type relationships
+    other_relationships = []  # For other relationships
+    
+    for rel_type in relationships.keys():
+        rel_name = rel_type.replace(":`", "").replace("`", "").strip(":")
+        if "MODEL" in rel_name.upper():
+            model_relationships.append(rel_name)
+        else:
+            other_relationships.append(rel_name)
+    
+    # Add optional matches for related entities (non-model relationships)
+    used_vars = {main_var}
+    for rel_name in other_relationships:
+        # Find target node types that this relationship could connect to
+        for target_node_key in nodes.keys():
+            target_type = target_node_key.replace(":`", "").replace("`", "").strip(":")
+            if target_type != main_entity:
+                # Create unique variable name
+                var_name = target_type.lower()[:3]
+                counter = 1
+                while var_name in used_vars:
+                    var_name = f"{target_type.lower()[:2]}{counter}"
+                    counter += 1
+                used_vars.add(var_name)
+                
+                optional_matches.append(f"OPTIONAL MATCH ({main_var})-[:{rel_name}]->({var_name}:{target_type})")
+                
+                # Add fields from connected entities
+                target_props = nodes.get(target_node_key, [])
+                for prop in target_props:
+                    if prop != "embedding":
+                        return_fields.append(f"{var_name}.{prop} AS {rel_name.lower()}_{prop}")
+    
+    # Handle model relationships specially for connected_models collection
+    for rel_name in model_relationships:
+        # Model relationships often connect same type entities (instance -> template)
+        instance_var = "instance"
+        optional_matches.append(f"OPTIONAL MATCH ({instance_var}:{main_entity})-[:{rel_name}]->({main_var})")
+        
+        # Create collection for connected models
+        if main_entity_key:
+            instance_props = nodes.get(main_entity_key, [])
+            collect_fields = []
+            for prop in instance_props:
+                if prop != "embedding":
+                    collect_fields.append(f"{prop}: {instance_var}.{prop}")
+            
+            if collect_fields:
+                collect_parts.append(f"COLLECT(DISTINCT {{{', '.join(collect_fields)}}}) AS connected_models")
+    
+    # If no model relationships found, create a simpler connected_models based on any reverse relationships
+    if not collect_parts:
+        # Look for any relationship that could represent instances
+        for rel_name in other_relationships:
+            if any(keyword in rel_name.upper() for keyword in ["HAS", "CONTAINS", "INCLUDES"]):
+                # Try reverse relationship for instances
+                instance_var = "inst"
+                optional_matches.append(f"OPTIONAL MATCH ({instance_var}:{main_entity})-[:{rel_name}]->({main_var})")
+                
+                if main_entity_key:
+                    instance_props = nodes.get(main_entity_key, [])
+                    collect_fields = []
+                    for prop in instance_props:
+                        if prop != "embedding":
+                            collect_fields.append(f"{prop}: {instance_var}.{prop}")
+                    
+                    if collect_fields:
+                        collect_parts.append(f"COLLECT(DISTINCT {{{', '.join(collect_fields)}}}) AS connected_models")
+                break
+    
+    # If still no connected_models, add an empty one
+    if not collect_parts:
+        collect_parts.append("[] AS connected_models")
+    
+    # Combine all return fields
+    all_returns = return_fields + collect_parts
+    
+    # Build the complete query
+    complete_query = "\n".join(query_parts) + "\n" + "\n".join(optional_matches) + "\n\n" + \
+                    f"RETURN\n    {',\\n    '.join(all_returns)}\n" + \
+                    f"ORDER BY similarity DESC\n" + \
+                    f"LIMIT $n"
+    
+    return complete_query
+
+def generate_universal_fallback_query(query_text: str) -> str:
+    """
+    Generate a universal fallback query that will always find something.
+    This is the last resort when all other queries fail.
+    """
+    words = [word.lower().strip() for word in query_text.split() if len(word.strip()) > 2]
+    
+    if not words:
+        # If no meaningful words, just return any nodes
+        return """
+        MATCH (n)
+        RETURN n, 0.1 as score, labels(n)[0] as node_type
+        LIMIT $n
+        """
+    
+    # Create a very broad fuzzy search
+    word_conditions = []
+    for word in words[:3]:  # Limit to first 3 words to avoid overly complex queries
+        word_conditions.append(f"toString(n) CONTAINS '{word}'")
+        word_conditions.append(f"any(prop in keys(n) WHERE toLower(toString(n[prop])) CONTAINS '{word}')")
+    
+    where_clause = " OR ".join(word_conditions)
+    
+    return f"""
+    MATCH (n)
+    WHERE {where_clause}
+    RETURN n, 0.3 as score, labels(n)[0] as node_type
+    ORDER BY score DESC
+    LIMIT $n
+    """
+
+def generate_fallback_fuzzy_query(query_text: str, schema: dict) -> str:
+    """
+    Generate a fallback fuzzy query when schema-aware generation fails.
+    Creates a comprehensive fuzzy search across all available node types.
+    """
+    query_words = [word.lower().strip() for word in query_text.split() if len(word.strip()) > 2]
+    
+    # Get all node labels from schema
+    node_labels = list(schema.get("nodes", {}).keys())
+    if not node_labels:
+        # Ultimate fallback if no schema available
+        return """
+        MATCH (n)
+        WHERE toString(n) CONTAINS $query_text OR any(prop in keys(n) WHERE toString(n[prop]) CONTAINS $query_text)
+        RETURN n, 0.5 as score
+        LIMIT 15
+        """
+    
+    # Build fuzzy query for each node type
+    match_clauses = []
+    for label in node_labels:
+        properties = schema["nodes"][label]
+        
+        # Create fuzzy conditions for this node type
+        fuzzy_conditions = []
+        
+        # Add embedding similarity if available
+        if "embedding" in properties:
+            fuzzy_conditions.append(f"""
+            REDUCE(dot = 0.0, i IN RANGE(0, SIZE(n.embedding)-1) | 
+                dot + n.embedding[i] * $embedding[i]
+            ) / (
+                SQRT(REDUCE(norm1 = 0.0, i IN RANGE(0, SIZE(n.embedding)-1) | 
+                    norm1 + n.embedding[i] * n.embedding[i]
+                )) * 
+                SQRT(REDUCE(norm2 = 0.0, i IN RANGE(0, SIZE($embedding)-1) | 
+                    norm2 + $embedding[i] * $embedding[i]
+                ))
+            ) > 0.2""")
+        
+        # Add text-based fuzzy matching for string properties
+        text_props = [prop for prop in properties if prop not in ["embedding", "id"]]
+        if text_props:
+            text_conditions = []
+            for prop in text_props[:3]:  # Limit to first 3 properties to avoid overly complex queries
+                text_conditions.extend([
+                    f"toLower(toString(n.{prop})) CONTAINS toLower('{word}')" 
+                    for word in query_words[:3]  # Limit to first 3 words
+                ])
+            
+            if text_conditions:
+                fuzzy_conditions.append(f"({' OR '.join(text_conditions)})")
+        
+        # If no specific conditions, fall back to generic search
+        if not fuzzy_conditions:
+            fuzzy_conditions.append(f"any(word in split(toLower($query_text), ' ') WHERE any(prop in keys(n) WHERE toLower(toString(n[prop])) CONTAINS word))")
+        
+        # Combine conditions for this label
+        where_clause = " OR ".join(fuzzy_conditions)
+        match_clauses.append(f"""
+        MATCH (n:{label})
+        WHERE {where_clause}
+        RETURN n, 0.6 as score, '{label}' as node_type
+        """)
+    
+    # Combine all matches with UNION
+    full_query = " UNION ".join(match_clauses)
+    full_query += """
+    ORDER BY score DESC
+    LIMIT $n
+    """
+    
+    return full_query
+
+def generate_schema_aware_cypher(query: str, schema: dict) -> str:
+    prompt = f"""
+You are a Cypher expert. Given the user's question and the Neo4j schema, generate a VALID Cypher query.
+
+Schema:
+{json.dumps(schema, indent=2)}
+
+User Query:
+{query}
+
+Rules:
+- DO NOT guess labels or properties not in the schema.
+- Only use available node labels, relationships, and properties.
+- Focus on accuracy, not creativity.
+- Return ONLY the Cypher query.
+"""
+    model = genai.GenerativeModel("gemini-2.0-flash")
+    print(prompt)
+    try:
+        response = model.generate_content(prompt)
+        cypher = response.text.strip().replace("```cypher", "").replace("```", "")
+        return cypher
+    except Exception as e:
+        print(f"[ERROR] Schema-aware Cypher generation failed: {e}")
+        return None
 
 
 
@@ -30,34 +383,1311 @@ from gen_embeddings_rdf import generate_and_store_embeddings
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+# AI Provider Configuration
+AI_PROVIDER = os.getenv("AI_PROVIDER", "openai")  # Options: "gemini" or "openai"
+logger.info(f"AI Provider configured: {AI_PROVIDER}")
 
-# Set up environment variables for Google API key
-os.environ["GOOGLE_API_KEY"] = "YOUR_GOOGLE_API_KEY"  # Replace with your actual API key
+# Set up environment variables for API keys
+os.environ["GOOGLE_API_KEY"] = "your-api-key"
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "your-api-key")
 
-# Configure the genai API with the Google API key
+# Configure AI providers
 genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
+openai_client = None
+
+if OPENAI_API_KEY and OPENAI_VERSION:
+    try:
+        if OPENAI_VERSION == "new":
+            # OpenAI >= 1.0.0
+            openai_client = OpenAI(api_key=OPENAI_API_KEY)
+            logger.info(f"OpenAI client initialized successfully (version: new, >=1.0.0)")
+        elif OPENAI_VERSION == "old":
+            # OpenAI < 1.0.0
+            openai.api_key = OPENAI_API_KEY
+            openai_client = openai  # Use the module directly for old version
+            logger.info(f"OpenAI configured successfully (version: old, <1.0.0)")
+    except Exception as e:
+        logger.warning(f"Failed to initialize OpenAI: {e}")
+        openai_client = None
+elif not OPENAI_API_KEY:
+    logger.info("OpenAI API key not provided - OpenAI provider unavailable")
 
 # Neo4j connection setup (replace with your connection details)
 uri = "neo4j://localhost:7687"
-username = "neo4j" # Replace with your Neo4j username
-password = "YOUR_PASSWORD" # Replace with your Neo4j password
+username = "neo4j"
+password = "your-neo4j-password"
 driver = GraphDatabase.driver(uri, auth=(username, password))
 graph = Graph(uri, auth=(username, password))
 
+# Configure neomodel connection (used by /semantic-search). Neomodel expects bolt:// scheme.
+neomodel_config.DATABASE_URL = f"bolt://{username}:{password}@localhost:7687"
+
 # Initialize Flask app
 app = Flask(__name__)
+CORS(app)  # Enable CORS for all routes
 
 # Global queue to store progress updates
 progress_queue = Queue()
 
-
-model = SentenceTransformer('all-MiniLM-L6-v2')
+# Initialize embedding models
+model = SentenceTransformer('all-MiniLM-L6-v2')  # Bi-encoder for fast retrieval
 embedding_queue = Queue()
+
+# Initialize cross-encoder for re-ranking (more accurate but slower)
+logger.info("Loading Cross-Encoder model for precision re-ranking...")
+try:
+    cross_encoder = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
+    logger.info("Cross-Encoder loaded successfully - precision re-ranking enabled")
+except Exception as e:
+    logger.warning(f"Failed to load Cross-Encoder: {e}. Falling back to bi-encoder only.")
+    cross_encoder = None
 
 
 global grpah_format
 graph_format = "aas"
 
+def generate_ai_response(prompt: str, stream: bool = True, provider: str = None):
+    """
+    Universal AI response generator that works with both Gemini and OpenAI (both old and new versions).
+    
+    Args:
+        prompt: The prompt to send to the AI
+        stream: Whether to stream the response
+        provider: Override the global AI_PROVIDER (optional)
+    
+    Yields/Returns:
+        For streaming: yields chunks with .text or .choices[0].delta.content
+        For non-streaming: returns complete response text
+    """
+    global AI_PROVIDER, openai_client, OPENAI_VERSION
+    
+    # Use override provider if specified, otherwise use global
+    current_provider = provider if provider else AI_PROVIDER
+    
+    try:
+        if current_provider.lower() == "openai":
+            if not openai_client:
+                raise ValueError("OpenAI client not initialized. Please set OPENAI_API_KEY environment variable.")
+            
+            # Handle different OpenAI versions
+            if OPENAI_VERSION == "new":
+                # OpenAI >= 1.0.0 (new client-based API)
+                response = openai_client.chat.completions.create(
+                    model="gpt-4o",  # or "gpt-4o-mini" for faster/cheaper
+                    messages=[{"role": "user", "content": prompt}],
+                    stream=stream,
+                    temperature=0.1
+                )
+                
+                if stream:
+                    return response
+                else:
+                    return response.choices[0].message.content
+                    
+            elif OPENAI_VERSION == "old":
+                # OpenAI < 1.0.0 (old module-based API)
+                response = openai_client.ChatCompletion.create(
+                    model="gpt-4",  # Use gpt-4 for old version compatibility
+                    messages=[{"role": "user", "content": prompt}],
+                    stream=stream,
+                    temperature=0.1
+                )
+                
+                if stream:
+                    return response
+                else:
+                    return response['choices'][0]['message']['content']
+            else:
+                raise ValueError("OpenAI version not detected properly")
+        
+        else:  # Default to Gemini
+            model = genai.GenerativeModel("gemini-2.0-flash")
+            response = model.generate_content(
+                prompt,
+                stream=stream,
+                generation_config=genai.types.GenerationConfig(temperature=0.1)
+            )
+            
+            if stream:
+                return response
+            else:
+                return response.text
+    
+    except Exception as e:
+        logger.error(f"AI response generation failed with {current_provider}: {e}")
+        raise
+
+
+@app.route('/set-ai-provider', methods=['POST'])
+@cross_origin()
+def set_ai_provider():
+    """API endpoint to switch between AI providers (gemini/openai)."""
+    global AI_PROVIDER
+    
+    try:
+        data = request.json
+        provider = data.get('provider', 'gemini').lower()
+        
+        if provider not in ['gemini', 'openai']:
+            return jsonify({
+                "status": "error",
+                "message": "Invalid provider. Choose 'gemini' or 'openai'"
+            }), 400
+        
+        # Check if OpenAI is available when switching to it
+        if provider == 'openai' and not openai_client:
+            return jsonify({
+                "status": "error",
+                "message": "OpenAI client not available. Please set OPENAI_API_KEY environment variable."
+            }), 400
+        
+        AI_PROVIDER = provider
+        logger.info(f"AI provider switched to: {provider}")
+        
+        return jsonify({
+            "status": "success",
+            "message": f"AI provider set to {provider}",
+            "current_provider": AI_PROVIDER
+        }), 200
+        
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@app.route('/get-ai-provider', methods=['GET'])
+@cross_origin()
+def get_ai_provider():
+    """Get current AI provider and available providers."""
+    return jsonify({
+        "current_provider": AI_PROVIDER,
+        "available_providers": ["gemini", "openai"],
+        "openai_available": openai_client is not None
+    }), 200
+
+
+# ============================================================================
+# Cross-Encoder Re-ranking Functions
+# ============================================================================
+
+def format_node_for_reranking(node_data):
+    """
+    Format a node for cross-encoder scoring.
+    Creates a natural language representation emphasizing important properties.
+    
+    Args:
+        node_data (dict): Node data with 'labels', 'properties', 'node_id', etc.
+    
+    Returns:
+        str: Formatted text representation of the node
+    """
+    labels = node_data.get('labels', [])
+    props = node_data.get('properties', {})
+    
+    # Build a natural language representation
+    parts = []
+    
+    # Label information
+    if labels:
+        parts.append(f"Type: {', '.join(labels)}")
+    
+    # Key properties that are most relevant for matching
+    important_keys = ['name', 'title', 'description', 'value', 'type', 
+                      'label', 'text', 'content', 'idShort', 'id']
+    
+    for key in important_keys:
+        if key in props and props[key]:
+            parts.append(f"{key}: {props[key]}")
+    
+    # Add other properties
+    for key, val in props.items():
+        if key not in important_keys and val:
+            # Limit property value length to avoid overwhelming the cross-encoder
+            val_str = str(val)[:100]
+            parts.append(f"{key}: {val_str}")
+    
+    return " | ".join(parts)
+
+
+def rerank_with_cross_encoder(query_text, candidates, top_k=None):
+    """
+    Re-rank candidate nodes using cross-encoder for higher precision.
+    
+    This is the second stage of a two-stage retrieval:
+    1. Bi-encoder (fast): Get initial candidates (~100 nodes)
+    2. Cross-encoder (accurate): Re-rank to final top_k
+    
+    Args:
+        query_text (str): User's search query
+        candidates (list): List of node dicts from bi-encoder retrieval
+        top_k (int): Number of top results to return (None = return all re-ranked)
+    
+    Returns:
+        list: Re-ranked candidates with updated 'rerank_score' field
+    """
+    if not cross_encoder:
+        logger.warning("Cross-encoder not available, skipping re-ranking")
+        return candidates
+    
+    if not candidates:
+        return candidates
+    
+    try:
+        # Format candidates for cross-encoder
+        formatted_candidates = [format_node_for_reranking(c) for c in candidates]
+        
+        # Create query-candidate pairs
+        pairs = [[query_text, cand_text] for cand_text in formatted_candidates]
+        
+        # Get cross-encoder scores (relevance scores)
+        logger.info(f"Re-ranking {len(candidates)} candidates with cross-encoder...")
+        scores = cross_encoder.predict(pairs)
+        
+        # Combine scores with original data
+        for i, candidate in enumerate(candidates):
+            candidate['rerank_score'] = float(scores[i])
+            # Keep original score for reference
+            if 'score' in candidate:
+                candidate['original_score'] = candidate['score']
+        
+        # Sort by re-ranking score (descending)
+        reranked = sorted(candidates, key=lambda x: x.get('rerank_score', 0), reverse=True)
+        
+        # Return top_k if specified
+        if top_k:
+            reranked = reranked[:top_k]
+        
+        logger.info(f"Re-ranking complete. Top score: {reranked[0]['rerank_score']:.4f}")
+        return reranked
+        
+    except Exception as e:
+        logger.error(f"Error in cross-encoder re-ranking: {e}")
+        return candidates  # Fallback to original order
+
+
+@app.route('/semantic-search', methods=['POST'])
+def semantic_search():
+    """Semantic search via neomodel with streaming output; schema-agnostic and no py2neo in this path."""
+    data = request.json or {}
+    query_text = data.get('query', '')
+    # Read requested top-K robustly and default to 16 if not provided
+    # Accept from JSON body and querystring; support common synonyms
+    raw_n = (
+        data.get('n')
+        or data.get('k')
+        or data.get('top_k')
+        or data.get('limit')
+        or request.args.get('n')
+        or request.args.get('k')
+        or request.args.get('top_k')
+        or request.args.get('limit')
+        or request.args.get('topK')
+    )
+    n_source = 'body'
+    if raw_n is None:
+        n_source = 'default'
+    elif request.args.get('n') or request.args.get('k') or request.args.get('top_k') or request.args.get('limit') or request.args.get('topK'):
+        n_source = 'querystring'
+    try:
+        n_results = int(raw_n) if raw_n is not None else 10
+    except Exception:
+        n_results = 10 ##################################################ooo000#####################
+    # Enforce a server-side minimum and maximum that can be tuned via env vars
+    try:
+        min_results = int(os.getenv('SEMANTIC_SEARCH_MIN_RESULTS', '10'))
+    except Exception:
+        min_results = 10
+    # Optionally ignore client-provided n entirely (default: true)
+    ignore_client_n = str(os.getenv('SEMANTIC_SEARCH_IGNORE_CLIENT_N', 'true')).lower() in {'1','true','yes','on'}
+    # Allow explicit override via force_n (query/body) to respect client n
+    force_n_flag = False
+    try:
+        fn_q = request.args.get('force_n')
+        fn_b = data.get('force_n') if isinstance(data, dict) else None
+        if fn_q is not None:
+            force_n_flag = fn_q.lower() in {'1','true','yes','on'}
+        elif fn_b is not None:
+            force_n_flag = bool(fn_b)
+    except Exception:
+        force_n_flag = False
+    if force_n_flag:
+        ignore_client_n = False
+    if ignore_client_n:
+        n_results = min_results
+        n_source = 'server'
+    try:
+        max_results = int(os.getenv('SEMANTIC_SEARCH_MAX_RESULTS', '10'))
+    except Exception:
+        max_results = 10
+    # Cap to max_results to ensure we return at most 11 by default
+    effective_n = min(max(n_results, min_results), max_results)
+    if ignore_client_n:
+        print(f"/semantic-search enforced_n_results: {effective_n} (min={min_results}, max={max_results}) force_n={force_n_flag}")
+    else:
+        print(f"/semantic-search requested n_results: {n_results} (source={n_source}, raw={raw_n}); capped_to: {effective_n} (min={min_results}, max={max_results}) force_n={force_n_flag}")
+
+
+    if isinstance(query_text, dict) and 'output' in query_text:
+        query_text = query_text['output']
+    if not query_text:
+        return jsonify({"error": "Query text is required"}), 400
+
+    if graph_format == "rdf":
+        return fix_semantic_search_for_rdf(data)
+
+    def generate():
+        query_embedding = get_embedding(query_text)
+        if not query_embedding:
+            yield "data: " + json.dumps({"error": "Failed to get query embedding"}) + "\n\n"
+            return
+
+        # Emit initial meta about n handling
+        try:
+            meta_n = {
+                'meta': {
+                    'requested_n': n_results,
+                    'effective_n': effective_n,
+                    'min_results': min_results,
+                    'max_results': max_results,
+                    'ignore_client_n': ignore_client_n,
+                    'force_n': force_n_flag
+                }
+            }
+            yield f"data: {json.dumps(meta_n)}\n\n"
+        except Exception:
+            pass
+
+        def nm_run(cypher: str, params: dict):
+            try:
+                rows, meta = neomodel_db.cypher_query(cypher, params)
+                cols = [m['name'] for m in meta] if meta and isinstance(meta[0], dict) and 'name' in meta[0] else meta
+                results = []
+                for row in rows:
+                    item = {}
+                    for i, col in enumerate(cols):
+                        val = row[i] if i < len(row) else None
+                        if isinstance(val, (list, tuple)):
+                            cleaned = []
+                            for v in val:
+                                if isinstance(v, dict):
+                                    cleaned.append(v)
+                                else:
+                                    try:
+                                        cleaned.append(dict(v))
+                                    except Exception:
+                                        cleaned.append(str(v))
+                            val = cleaned
+                        elif not isinstance(val, (str, int, float, bool, dict)) and val is not None:
+                            try:
+                                val = dict(val)
+                            except Exception:
+                                val = str(val)
+                        item[col] = val
+                    results.append(item)
+                return results
+            except Exception as e:
+                logging.error(f"neomodel cypher_query failed: {e}")
+                return []
+
+        # ----------------------
+        # Schema-agnostic, multi-pass retrieval
+        # ----------------------
+        def tokenize(text: str):
+            import re
+            raw = [t for t in re.split(r"[^a-zA-Z0-9]+", str(text).lower()) if t]
+            return [t for t in raw if len(t) >= 4][:12]
+
+        def count_token_hits(item: dict, tokens: list[str]) -> int:
+            if not tokens:
+                return 0
+            def scan_obj(obj):
+                score = 0
+                if isinstance(obj, str):
+                    s = obj.lower()
+                    for tok in tokens:
+                        if tok in s:
+                            score += 1
+                elif isinstance(obj, dict):
+                    for v in obj.values():
+                        score += scan_obj(v)
+                elif isinstance(obj, list):
+                    for v in obj:
+                        score += scan_obj(v)
+                return score
+            score = 0
+            if isinstance(item.get('props'), dict):
+                score += scan_obj(item['props'])
+            if isinstance(item.get('connected_nodes'), list):
+                for cn in item['connected_nodes']:
+                    if isinstance(cn, dict) and isinstance(cn.get('props'), dict):
+                        score += scan_obj(cn['props'])
+            if isinstance(item.get('labels'), list):
+                score += scan_obj(" ".join(item['labels']))
+            return score
+
+        def dedupe_by_signature(items: list[dict]) -> list[dict]:
+            seen = set()
+            out = []
+            for it in items:
+                try:
+                    sig = json.dumps({'labels': it.get('labels', []), 'props': it.get('props', {})}, sort_keys=True, default=str)
+                except Exception:
+                    sig = str(it.get('labels')) + '|' + str(it.get('props'))
+                if sig not in seen:
+                    seen.add(sig)
+                    out.append(it)
+            return out
+
+        def run_embed_search(sim_threshold: float, per_label_limit: int) -> list[dict]:
+            schema_q_local = (
+                "CALL db.schema.nodeTypeProperties() YIELD nodeLabels, propertyName, propertyTypes "
+                "WITH nodeLabels, propertyName, propertyTypes "
+                "WHERE toLower(propertyName) CONTAINS 'embedding' "
+                "   OR any(t IN propertyTypes WHERE toLower(t) CONTAINS 'float' AND toLower(t) CONTAINS 'list') "
+                "UNWIND nodeLabels AS label "
+                "RETURN label, collect(DISTINCT propertyName) AS props "
+                "ORDER BY size(props) DESC"
+            )
+            meta_local = nm_run(schema_q_local, {})
+            all_res = []
+            if meta_local:
+                for node_meta in meta_local:
+                    label = node_meta.get('label')
+                    props = node_meta.get('props') or []
+                    emb = next((p for p in props if 'embedding' in p.lower()), (props[0] if props else None))
+                    if label and emb:
+                        q = f"""
+                        MATCH (n:`{label}`)
+                        WHERE n.`{emb}` IS NOT NULL
+                        WITH n,
+                             REDUCE(dot = 0.0, i IN RANGE(0, SIZE(n.`{emb}`)-1) |
+                                 dot + n.`{emb}`[i] * $embedding[i]
+                             ) / (
+                                 SQRT(REDUCE(n1 = 0.0, i IN RANGE(0, SIZE(n.`{emb}`)-1) | n1 + n.`{emb}`[i] * n.`{emb}`[i])) *
+                                 SQRT(REDUCE(n2 = 0.0, i IN RANGE(0, SIZE($embedding)-1) | n2 + $embedding[i] * $embedding[i]))
+                             ) AS similarity
+                        WHERE similarity > $threshold
+                    OPTIONAL MATCH (n)-[r]-(m)
+                    WITH n, similarity,
+                        collect(DISTINCT {{labels: labels(m), props: properties(m), node_id: elementId(m), rel_type: type(r), direction: CASE WHEN startNode(r) = n THEN 'outgoing' ELSE 'incoming' END}}) AS connected_nodes
+                    RETURN labels(n) AS labels, properties(n) AS props, connected_nodes, similarity AS score, elementId(n) AS node_id
+                        ORDER BY score DESC
+                        LIMIT $lim
+                        """
+                        label_res = nm_run(q, {"embedding": query_embedding, "threshold": float(sim_threshold), "lim": int(per_label_limit)})
+                        all_res.extend(label_res)
+            all_res.sort(key=lambda x: x.get('score', 0), reverse=True)
+            return all_res
+
+        tokens = tokenize(query_text)
+        embed1 = run_embed_search(sim_threshold=0.3, per_label_limit=50)
+        token_fallback_q = (
+            "MATCH (n) "
+            "WITH n, [k IN keys(n) WHERE n[k] IS NOT NULL AND size(toString(n[k]))>0 AND k <> 'embedding' | toLower(toString(n[k]))] AS texts "
+            "WITH n, reduce(s=0, t IN texts | s + reduce(s2=0, tok IN $tokens | s2 + CASE WHEN t CONTAINS tok THEN 1 ELSE 0 END)) AS hits "
+            "WHERE hits > 0 "
+            "OPTIONAL MATCH (n)-[*1..2]-(m) "
+            "WITH n, hits, collect(DISTINCT {labels: labels(m), props: properties(m), node_id: elementId(m)}) AS connected_nodes "
+            "RETURN labels(n) AS labels, properties(n) AS props, connected_nodes, toFloat(hits) AS score, elementId(n) AS node_id "
+            "ORDER BY score DESC LIMIT $limit"
+        )
+        token_fallback = nm_run(token_fallback_q, {"tokens": tokens, "limit": max(effective_n * 8, 200)}) if tokens else []
+        combined = dedupe_by_signature(embed1 + token_fallback)
+        if len(combined) < effective_n:
+            embed2 = run_embed_search(sim_threshold=0.2, per_label_limit=150)
+            combined = dedupe_by_signature(combined + embed2)
+        else:
+            embed2 = []
+        token_hits_map = {}
+        for it in combined:
+            token_hits_map[id(it)] = count_token_hits(it, tokens)
+        combined.sort(key=lambda x: (token_hits_map.get(id(x), 0), x.get('score', 0.0)), reverse=True)
+        results_list = combined[:effective_n]
+
+        # Promote connected nodes that show token evidence to primary results and fetch their neighborhoods
+        #try:
+        def fetch_node_full(nid: str):
+            q = (
+        "MATCH (n) WHERE elementId(n)=$id "
+                "OPTIONAL MATCH (n)-[r]-(m) "
+        "WITH n, collect(DISTINCT {labels: labels(m), props: properties(m), node_id: elementId(m), rel_type: type(r), direction: CASE WHEN startNode(r)=n THEN 'outgoing' ELSE 'incoming' END}) AS connected_nodes "
+        "RETURN labels(n) AS labels, properties(n) AS props, connected_nodes, elementId(n) AS node_id"
+            )
+            res = nm_run(q, {"id": str(nid)})
+            return res[0] if res else None
+
+        def key_of(item: dict):
+            if 'node_id' in item and item['node_id'] is not None:
+                return ('id', str(item['node_id']))
+            return ('sig', json.dumps({'labels': item.get('labels'), 'props': item.get('props')}, sort_keys=True, default=str))
+
+        # Promotion of neighbors to primaries (skip when effective_n == 1 unless explicitly allowed)
+        allow_promotion_single = False
+        try:
+            qp = request.args.get('allow_promotion_single')
+            bp = data.get('allow_promotion_single') if isinstance(data, dict) else None
+            if qp is not None:
+                allow_promotion_single = qp.lower() in {'1','true','yes','on'}
+            elif bp is not None:
+                allow_promotion_single = bool(bp)
+        except Exception:
+            allow_promotion_single = False
+
+        if effective_n == 1 and not allow_promotion_single:
+            promoted_list = list(results_list)
+            try:
+                yield f"data: {json.dumps({'meta': {'promotion': 'skipped_for_single_result'}})}\n\n"
+            except Exception:
+                pass
+        else:
+            promoted = {key_of(it): it for it in results_list}
+            for it in list(promoted.values()):
+                for cn in (it.get('connected_nodes') or []):
+                    # Simple evidence check using existing token scoring
+                    nhits = count_token_hits({'props': cn.get('props', {}), 'labels': cn.get('labels', [])}, tokens)
+                    if nhits >= 1 and cn.get('node_id') is not None:
+                        full = fetch_node_full(cn['node_id'])
+                        if full:
+                            # carry over or combine score
+                            full['score'] = max(full.get('score', 0.0), it.get('score', 0.0))
+                            promoted[key_of(full)] = full
+
+            promoted_list = list(promoted.values())
+        # Re-rank by token evidence then similarity score
+        promoted_list.sort(key=lambda x: (count_token_hits(x, tokens), x.get('score', 0.0)), reverse=True)
+        
+        # ============================================================================
+        # Cross-Encoder Re-ranking (Stage 2: Precision)
+        # ============================================================================
+        # Two-stage retrieval:
+        # 1. Bi-encoder (above): Fast retrieval of top candidates
+        # 2. Cross-encoder (here): Accurate re-ranking for final results
+        #
+        # Strategy: Get more candidates than needed, then re-rank to effective_n
+        # This improves precision by 15-25% without keyword matching
+        rerank_pool_size = min(len(promoted_list), effective_n * 3)  # Re-rank 3x candidates
+        rerank_candidates = promoted_list[:rerank_pool_size]
+        
+        if cross_encoder and len(rerank_candidates) > 1:
+            logger.info(f"Re-ranking top {len(rerank_candidates)} candidates with cross-encoder...")
+            reranked = rerank_with_cross_encoder(query_text, rerank_candidates, top_k=effective_n)
+            
+            # Check if re-ranking is helpful (hybrid approach)
+            top_score = reranked[0].get('rerank_score', -999) if reranked else -999
+            use_reranked = top_score >= -2.0  # Threshold for "useful" re-ranking
+            
+            if not use_reranked:
+                logger.warning(f"Cross-encoder scores too low (top: {top_score:.4f}), falling back to semantic ranking")
+                # Fall back to original semantic ranking
+                results_list = promoted_list[:effective_n]
+                fallback_used = True
+            else:
+                logger.info(f"Re-ranking successful. Top score: {top_score:.4f}")
+                results_list = reranked[:effective_n]
+                fallback_used = False
+            
+            # Send re-ranking metadata
+            meta_rerank = {
+                'meta': {
+                    'reranking': {
+                        'enabled': True,
+                        'candidates_pool': len(rerank_candidates),
+                        'top_rerank_score': top_score,
+                        'fallback_to_semantic': fallback_used,
+                        'score_improvement': (
+                            reranked[0].get('rerank_score', 0) - reranked[0].get('original_score', 0)
+                            if reranked and 'original_score' in reranked[0] and not fallback_used else 0
+                        )
+                    }
+                }
+            }
+            yield f"data: {json.dumps(meta_rerank)}\n\n"
+        else:
+            # Fallback: cross-encoder not available or too few candidates
+            results_list = promoted_list[:effective_n]
+        
+        #except Exception as _e:
+            # Promotion is best-effort; proceed with base results if anything goes wrong
+        #    pass
+
+        #try:
+        logger.info(f"Results list size after re-ranking/fallback: {len(results_list)}")
+        meta_evt0 = {
+            'meta': {
+                'requested_n': n_results,
+                'effective_n': effective_n,
+                'embed1': len(embed1),
+                'fallback_tokens': len(token_fallback),
+                'embed2': len(embed2),
+        'unique_after_merge': len(combined),
+        'returned': len(results_list)
+            }
+        }
+        yield f"data: {json.dumps(meta_evt0)}\n\n"
+        #except Exception:
+        #    pass
+
+        logger.info(f"About to call fuzzy_match_results with {len(results_list)} results")
+        matched_results = fuzzy_match_results(results_list, query_text)
+        logger.info(f"After fuzzy_match_results: {len(matched_results)} matched results")
+        
+        # ------------------------------------------------------------------
+        # Schema-agnostic serializer (preserve neighbors, trim verbosity)
+        # - Keeps all connected_nodes (distance-1) intact
+        # - Removes embeddings and volatile meta fields
+        # - Trims very long string properties to a safe max length
+        # - Drops None/empty values to save space
+        # ------------------------------------------------------------------
+        def _trim_value(v, max_len=400):
+            try:
+                if isinstance(v, str):
+                    # Collapse whitespace/newlines to single spaces
+                    s = " ".join(v.split())
+                    if len(s) > max_len:
+                        return s[:max_len] + "…"
+                    return s
+                return v
+            except Exception:
+                return v
+
+        def _clean_props(props: dict, drop_keys=("embedding",), max_str_len=400):
+            if not isinstance(props, dict):
+                return props
+            out = {}
+            for k, v in props.items():
+                if k in drop_keys:
+                    continue
+                if v is None:
+                    continue
+                # Skip empty strings or containers
+                if isinstance(v, str) and v.strip() == "":
+                    continue
+                if isinstance(v, (list, dict)) and len(v) == 0:
+                    continue
+                out[k] = _trim_value(v, max_len=max_str_len)
+            return out
+
+        def serialize_results(items: list, instance_limit: int = 20) -> list:
+            cleaned = []
+            for it in items or []:
+                if not isinstance(it, dict):
+                    continue
+                new_it = {}
+                # Always carry structure fields first
+                if 'labels' in it:
+                    new_it['labels'] = it['labels']
+                if 'props' in it:
+                    # Main node props: moderate cap
+                    new_it['props'] = _clean_props(it.get('props') or {}, max_str_len=160)
+                # Keep neighbors intact but cleaned
+                cn = it.get('connected_nodes')
+                if isinstance(cn, list):
+                    new_cn = []
+                    # Filter out generic instance nodes to reduce noise
+                    type_nodes = []
+                    instance_nodes = []
+                    for cn_it in cn:
+                        if not isinstance(cn_it, dict):
+                            continue
+                        props = cn_it.get('props') or {}
+                        kind = props.get('assetKind', '')
+                        # Separate Type nodes from Instance nodes
+                        if kind == 'Type':
+                            type_nodes.append(cn_it)
+                        elif kind == 'Instance':
+                            instance_nodes.append(cn_it)
+                        else:
+                            # Keep all non-Asset nodes (Manufacturer, Capability, etc.)
+                            type_nodes.append(cn_it)
+                    
+                    # Limit instances based on parameter (default 20, but can be increased for counting queries)
+                    filtered_cn = type_nodes + instance_nodes[:instance_limit]
+                    
+                    for cn_it in filtered_cn:
+                        cn_new = {}
+                        if 'labels' in cn_it:
+                            cn_new['labels'] = cn_it['labels']
+                        if 'props' in cn_it:
+                            # Neighbor props: tighter cap (many entries)
+                            cn_new['props'] = _clean_props(cn_it.get('props') or {}, max_str_len=80)
+                        if 'rel_type' in cn_it:
+                            cn_new['rel_type'] = cn_it['rel_type']
+                        if 'direction' in cn_it:
+                            cn_new['direction'] = cn_it['direction']
+                        # Keep stable id if present (as string) for dedupe downstream
+                        if cn_it.get('node_id') is not None:
+                            cn_new['node_id'] = str(cn_it['node_id'])
+                        if cn_new:
+                            new_cn.append(cn_new)
+                    new_it['connected_nodes'] = new_cn
+                # Retain only minimal meta on the primary item
+                # Keep node_id if present for dedup logic; drop other transient scores
+                if it.get('node_id') is not None:
+                    new_it['node_id'] = str(it['node_id'])
+                cleaned.append(new_it)
+            return cleaned
+
+        # Apply serializer early to reduce payload before downstream steps
+        # Determine instance limit based on query intent
+        # Check if query needs instances (counting, availability queries)
+        needs_instances_flag = False #ai_result.get('needs_instances', 'false') == 'true'
+        query_lower = str(query_text).lower() if query_text else ''
+        # Fallback: also check for counting/availability keywords
+        if not needs_instances_flag:
+            counting_keywords = ['count', 'how many', 'available', 'online', 'offline', 'unavailable']
+            needs_instances_flag = any(kw in query_lower for kw in counting_keywords)
+        
+        instance_limit = 999999 if needs_instances_flag else 20  # Show all instances for counting queries
+        
+        serialized_before_chars = len(json.dumps(matched_results, default=str)) if matched_results else 0
+        matched_results = serialize_results(matched_results, instance_limit=instance_limit)
+        serialized_after_chars = len(json.dumps(matched_results, default=str)) if matched_results else 0
+        try:
+            yield f"data: {json.dumps({'meta': {'serializer': {'before_chars': serialized_before_chars, 'after_chars': serialized_after_chars, 'reduction_percent': (round((serialized_before_chars-serialized_after_chars)/serialized_before_chars*100,1) if serialized_before_chars else 0)}}})}\n\n"
+        except Exception:
+            pass
+
+        # Compact encoding function (tokenized) - defined here to be available for relaxation steps
+        def compact_encode_results(results: list) -> tuple:
+            """
+            Advanced compact encoding with token dictionaries to minimize repetition.
+            Strategy:
+              - Build dictionaries for property keys (K), labels (T), relationship types (R), directions (D)
+              - Replace repeated strings with integer indices
+              - Use short keys: L (labels idx list), P (prop key idx -> value), C (connections), r (rel idx), d (dir idx)
+            Returns (encoded_json, original_len, encoded_len, dicts)
+            """
+            if not results:
+                return ("[]", 0, 2, {})
+            original_json = json.dumps(results, default=str)
+            original_len = len(original_json)
+
+            key_vocab = []  # property keys
+            label_vocab = []  # node labels
+            rel_vocab = []  # relationship types
+            dir_vocab = []  # directions
+
+            def idx_of(val, vocab):
+                try:
+                    if val not in vocab:
+                        vocab.append(val)
+                    return vocab.index(val)
+                except Exception:
+                    return None
+
+            encoded_items = []
+            for item in results:
+                if not isinstance(item, dict):
+                    continue
+                enc_item = {}
+                # Labels
+                labels = item.get('labels') or []
+                if labels:
+                    enc_item['L'] = [idx_of(lb, label_vocab) for lb in labels if lb is not None]
+                # Props
+                props = item.get('props') if isinstance(item.get('props'), dict) else {}
+                if props:
+                    ep = {}
+                    for k, v in props.items():
+                        ki = idx_of(k, key_vocab)
+                        if ki is None:
+                            continue
+                        ep[str(ki)] = v
+                    if ep:
+                        enc_item['P'] = ep
+                # Connections
+                conns = []
+                for cn in item.get('connected_nodes') or []:
+                    if not isinstance(cn, dict):
+                        continue
+                    ecn = {}
+                    clabels = cn.get('labels') or []
+                    if clabels:
+                        ecn['L'] = [idx_of(lb, label_vocab) for lb in clabels if lb is not None]
+                    cprops = cn.get('props') if isinstance(cn.get('props'), dict) else {}
+                    if cprops:
+                        cp = {}
+                        for k, v in cprops.items():
+                            ki = idx_of(k, key_vocab)
+                            if ki is None:
+                                continue
+                            cp[str(ki)] = v
+                        if cp:
+                            ecn['P'] = cp
+                    rel_type = cn.get('rel_type')
+                    if rel_type:
+                        ecn['r'] = idx_of(rel_type, rel_vocab)
+                    direction = cn.get('direction')
+                    if direction:
+                        ecn['d'] = idx_of(direction, dir_vocab)
+                    if ecn:
+                        conns.append(ecn)
+                if conns:
+                    enc_item['C'] = conns
+                if enc_item:
+                    encoded_items.append(enc_item)
+
+            dicts = {
+                'K': key_vocab,
+                'T': label_vocab,
+                'R': rel_vocab,
+                'D': dir_vocab
+            }
+            payload = {'dicts': dicts, 'data': encoded_items}
+            encoded_json = json.dumps(payload, default=str, separators=(',', ':'))
+            encoded_len = len(encoded_json)
+            return (encoded_json, original_len, encoded_len, dicts)
+
+        # ------------------------------------------------------------------
+        # Auto-relaxation: increment result count by 1 until compact length >= 25000
+        # Skips if force_n is active or expansion disabled intentionally.
+        # ------------------------------------------------------------------
+        auto_relax_threshold = 25000
+        auto_relax_enabled = True
+        try:
+            ar_q = request.args.get('auto_relax')
+            ar_b = data.get('auto_relax') if isinstance(data, dict) else None
+            if ar_q is not None:
+                auto_relax_enabled = ar_q.lower() in {'1','true','yes','on'}
+            elif ar_b is not None:
+                auto_relax_enabled = bool(ar_b)
+        except Exception:
+            auto_relax_enabled = True
+        # Do not auto-relax if force_n was used to enforce strict count
+        if force_n_flag:
+            auto_relax_enabled = False
+
+        # Build a ranked source list (after promotion logic) for relaxing
+        ranked_source = promoted_list if 'promoted_list' in locals() else results_list
+
+        def _encode_for_length(items):
+            enc, o_len, e_len, _dm = compact_encode_results(items)
+            return enc, e_len
+
+        # Initial encoding for current matched_results
+        enc_str_initial, enc_len_initial = _encode_for_length(matched_results)
+        if auto_relax_enabled and enc_len_initial < auto_relax_threshold:
+            # Iteratively grow by 1 until threshold or source exhausted
+            current_k = len(matched_results)
+            iteration = 0
+            while enc_len_initial < auto_relax_threshold and current_k < len(ranked_source):
+                iteration += 1
+                current_k += 1
+                grow_slice = ranked_source[:current_k]
+                # Re-run fuzzy + serialize for new slice
+                grown = fuzzy_match_results(grow_slice, query_text)
+                grown = serialize_results(grown, instance_limit=instance_limit)
+                enc_str_new, enc_len_new = _encode_for_length(grown)
+                meta_relax = {
+                    'meta': {
+                        'auto_relax_iteration': iteration,
+                        'candidate_k': current_k,
+                        'encoded_chars': enc_len_new,
+                        'target_chars': auto_relax_threshold,
+                        'met_target': enc_len_new >= auto_relax_threshold
+                    }
+                }
+                try:
+                    yield f"data: {json.dumps(meta_relax)}\n\n"
+                except Exception:
+                    pass
+                if enc_len_new > enc_len_initial:
+                    matched_results = grown
+                    enc_str_initial = enc_str_new
+                    enc_len_initial = enc_len_new
+                if enc_len_initial >= auto_relax_threshold:
+                    break
+            # emit final meta state
+            try:
+                yield f"data: {json.dumps({'meta': {'auto_relax_final_k': len(matched_results), 'final_encoded_chars': enc_len_initial, 'target_chars': auto_relax_threshold}})}\n\n"
+            except Exception:
+                pass
+        # Schema-agnostic compaction: keep only items that contain connected_nodes and dedupe
+        #try:
+        before_count = len(matched_results)
+        logger.info(f"Before connected_nodes filtering: {before_count} results")
+        filtered = []
+        seen = set()
+        for item in matched_results:
+            if not isinstance(item, dict):
+                continue
+            cn = item.get('connected_nodes', None)
+            if not (isinstance(cn, list) and len(cn) > 0):
+                # Skip items without connected context to reduce overload
+                logger.debug(f"Skipping item without connected_nodes: {item.get('labels', [])}")
+                continue
+            # Build a schema-agnostic signature using labels + props (minus embedding + volatile fields)
+            labels = item.get('labels', [])
+            props = dict(item.get('props', {}) or {})
+            # Drop heavy/volatile keys from signature
+            props.pop('embedding', None)
+            for k in ['score', 'orig_score', 'similarity', 'node_id']:
+                props.pop(k, None)
+            try:
+                sig = json.dumps({'labels': labels, 'props': props}, sort_keys=True, default=str)
+            except Exception:
+                sig = str(labels) + '|' + str(props)
+            if sig in seen:
+                continue
+            seen.add(sig)
+            filtered.append(item)
+
+        # Always keep only items that have connected_nodes
+        matched_results = filtered
+        logger.info(f"After connected_nodes filtering: {len(matched_results)} results")
+        
+        # Check if we have empty results - this might be why response stops
+        if len(matched_results) == 0:
+            logger.error("NO RESULTS after filtering! This will cause empty response.")
+            # Emergency fallback: use original results_list without filtering
+            logger.warning("Emergency fallback: using results without connected_nodes filter")
+            matched_results = results_list[:effective_n]
+        
+        # Emit diagnostic meta event for filtering
+        #try:
+        meta_evt_filter = {
+            'meta': {
+                'filtered_before': before_count,
+                'filtered_after': len(matched_results),
+                'filter_rule': 'keep_only_with_connected_nodes+dedupe',
+                'emergency_fallback_used': len(filtered) == 0
+            }
+        }
+        yield f"data: {json.dumps(meta_evt_filter)}\n\n"
+        # except Exception:
+            #     pass
+        #except Exception:
+            # Best-effort compaction; proceed if anything goes wrong
+         #   pass
+        # Optional stricter result-level compaction: collapse items with identical neighbor sets (schema-agnostic)
+        strict_flag = False
+        try:
+            strict_flag = bool(data.get('compact_strict'))
+        except Exception:
+            pass
+        if not strict_flag:
+            qs_flag = request.args.get('compact_strict')
+            if qs_flag is not None:
+                strict_flag = qs_flag.lower() in {'1','true','yes','on'}
+
+        if strict_flag and matched_results:
+            def neighbor_set_signature(item: dict) -> str:
+                acc = []
+                for cn in item.get('connected_nodes') or []:
+                    if not isinstance(cn, dict):
+                        continue
+                    rel = cn.get('rel_type')
+                    # prefer stable neighbor identity
+                    nid = cn.get('node_id')
+                    if nid is None:
+                        try:
+                            nprops = dict(cn.get('props') or {})
+                            nprops.pop('embedding', None)
+                            nsig = json.dumps({'labels': cn.get('labels'), 'props': nprops}, sort_keys=True, default=str)
+                        except Exception:
+                            nsig = str(cn.get('labels')) + '|' + str(cn.get('props'))
+                    else:
+                        nsig = f"id:{nid}"
+                    # ignore direction when forming signature to avoid bidirectional duplication
+                    acc.append((rel, nsig))
+                acc.sort()
+                return json.dumps(acc, sort_keys=True)
+
+            seen_ns = set()
+            compacted = []
+            for it in matched_results:
+                ns = neighbor_set_signature(it)
+                if ns in seen_ns:
+                    continue
+                seen_ns.add(ns)
+                compacted.append(it)
+            matched_results = compacted
+
+            yield f"data: {json.dumps({'meta': {'strict_compaction': True, 'after': len(matched_results)}})}\n\n"
+    # end strict compaction
+
+        # Deduplicate connections: avoid bidirectional duplicates and nested repeats
+        #try:
+        seen_edges = set()  # undirected edge key: (min_id, max_id, rel_type) using elementId strings
+        for item in matched_results:
+            if not isinstance(item, dict):
+                continue
+            cn_list = item.get('connected_nodes')
+            if not isinstance(cn_list, list):
+                continue
+            primary_id = item.get('node_id')
+            local_seen = set()  # per-item seen by neighbor signature and rel_type
+            deduped_cn = []
+            for cn in cn_list:
+                if not isinstance(cn, dict):
+                    continue
+                rel_type = cn.get('rel_type')
+                # neighbor identity (prefer node_id, fallback to labels+props signature)
+                n_id = cn.get('node_id')
+                if n_id is None:
+                    try:
+                        n_sig = json.dumps({'labels': cn.get('labels'), 'props': cn.get('props')}, sort_keys=True, default=str)
+                    except Exception:
+                        n_sig = str(cn.get('labels')) + '|' + str(cn.get('props'))
+                    neighbor_key = ('sig', n_sig)
+                else:
+                    neighbor_key = ('id', str(n_id))
+                local_key = (neighbor_key, rel_type)
+                if local_key in local_seen:
+                    continue  # duplicate within same list
+                # global undirected edge key, if both ids are available
+                global_key = None
+                if primary_id is not None and n_id is not None:
+                    a, b = sorted([str(primary_id), str(n_id)])
+                    global_key = (a, b, rel_type)
+                    if global_key in seen_edges:
+                        continue  # skip mirrored/bidirectional duplicate across results
+                # accept this connection
+                local_seen.add(local_key)
+                if global_key is not None:
+                    seen_edges.add(global_key)
+                deduped_cn.append(cn)
+            item['connected_nodes'] = deduped_cn
+        #except Exception:
+        #    pass
+
+        # Strip only meta fields to shorten payload without losing domain info
+        #try:
+        remove_keys = {"node_id", "score", "orig_score", "similarity"}
+        cleaned = []
+        for item in matched_results:
+            if not isinstance(item, dict):
+                cleaned.append(item)
+                continue
+            base = {k: v for k, v in item.items() if k not in remove_keys}
+            # Clean connected_nodes entries but keep their props intact
+            if isinstance(base.get("connected_nodes"), list):
+                new_cn = []
+                for cn in base["connected_nodes"]:
+                    if isinstance(cn, dict):
+                        new_cn.append({k: v for k, v in cn.items() if k not in remove_keys})
+                    else:
+                        new_cn.append(cn)
+                base["connected_nodes"] = new_cn
+            cleaned.append(base)
+        matched_results = cleaned
+        #except Exception:
+        #    pass
+        # Emit a small metadata event to make counts visible to the client logs
+        #try:
+        meta_evt = {
+            'meta': {
+                'requested_n': n_results,
+                'effective_n': effective_n,
+                'returned': len(matched_results)
+            }
+        }
+        yield f"data: {json.dumps(meta_evt)}\n\n"
+        #except Exception:
+        #    pass
+        
+    # Filter out embedding property from results before passing to LLM
+        for result in matched_results:
+            if 'props' in result and isinstance(result['props'], dict):
+                result['props'].pop('embedding', None)
+            if 'connected_nodes' in result and isinstance(result['connected_nodes'], list):
+                for node in result['connected_nodes']:
+                    if 'props' in node and isinstance(node['props'], dict):
+                        node['props'].pop('embedding', None)
+        
+        print(matched_results)
+        print("Number of fetched nodes:", len(matched_results))
+              
+        # ------------------------------------------------------------------
+        # Adaptive expansion (guarded by allow_expansion): increase effective_n
+        # until encoded payload reaches target size; otherwise respect enforced_n.
+        # ------------------------------------------------------------------
+        def encode_current(results):
+            return compact_encode_results(results)
+
+        # Determine whether expansion is allowed. Default: disallow when server
+        # enforces n=1 (min=max=1) unless explicitly enabled by allow_expansion.
+        allow_expansion = False
+        try:
+            qs_allow = request.args.get('allow_expansion')
+            body_allow = data.get('allow_expansion') if isinstance(data, dict) else None
+            if qs_allow is not None:
+                allow_expansion = qs_allow.lower() in {'1','true','yes','on'}
+            elif body_allow is not None:
+                allow_expansion = bool(body_allow)
+            else:
+                # infer from server caps: if strictly capped to 1, don't expand
+                allow_expansion = not (effective_n == 1 and os.getenv('SEMANTIC_SEARCH_MIN_RESULTS','1') == '1' and os.getenv('SEMANTIC_SEARCH_MAX_RESULTS','1') == '1')
+        except Exception:
+            allow_expansion = False
+
+        if allow_expansion:
+            target_chars = None
+            try:
+                target_chars = int(data.get('min_compact_chars') or request.args.get('min_compact_chars') or 70000)
+            except Exception:
+                target_chars = 70000
+            expand_max = None
+            try:
+                expand_max = int(data.get('expand_max') or request.args.get('expand_max') or max(effective_n*5, effective_n+10))
+            except Exception:
+                expand_max = max(effective_n*5, effective_n+10)
+            expand_step = None
+            try:
+                expand_step = int(data.get('expand_step') or request.args.get('expand_step') or max(5, effective_n//2 or 1))
+            except Exception:
+                expand_step = max(5, effective_n//2 or 1)
+
+            if expand_max < effective_n:
+                expand_max = effective_n
+            if expand_step <= 0:
+                expand_step = 5
+
+            source_ranked = promoted_list
+
+            def build_results(k):
+                base = source_ranked[:k]
+                fm = fuzzy_match_results(base, query_text)
+                fm = serialize_results(fm, instance_limit=instance_limit)
+                return fm
+
+            matched_results_current = matched_results
+            encoded_results, orig_len, enc_len, dict_maps = encode_current(matched_results_current)
+            iteration = 0
+            while enc_len < target_chars and len(source_ranked) > len(matched_results_current) and len(matched_results_current) < expand_max:
+                new_k = min(len(matched_results_current) + expand_step, expand_max, len(source_ranked))
+                iteration += 1
+                expanded = build_results(new_k)
+                enc_tmp, _, enc_len_tmp, dict_tmp = encode_current(expanded)
+                meta_expand = {
+                    'meta': {
+                        'expansion_iteration': iteration,
+                        'candidate_k': new_k,
+                        'encoded_chars': enc_len_tmp,
+                        'target_chars': target_chars,
+                        'met_target': enc_len_tmp >= target_chars
+                    }
+                }
+                try:
+                    yield f"data: {json.dumps(meta_expand)}\n\n"
+                except Exception:
+                    pass
+                if enc_len_tmp > enc_len:
+                    matched_results_current = expanded
+                    encoded_results, orig_len, enc_len, dict_maps = enc_tmp, orig_len, enc_len_tmp, dict_tmp
+                if enc_len >= target_chars:
+                    break
+
+            matched_results = matched_results_current
+            reduction_pct = ((orig_len - enc_len) / orig_len * 100) if orig_len > 0 else 0
+        else:
+            # No expansion; encode current matched_results only
+            encoded_results, orig_len, enc_len, dict_maps = encode_current(matched_results)
+            reduction_pct = ((orig_len - enc_len) / orig_len * 100) if orig_len > 0 else 0
+        
+        # Emit diagnostic for encoding
+        try:
+            meta_enc = {
+                'meta': {
+                    'compact_encoding': True,
+                    'original_chars': orig_len,
+                    'encoded_chars': enc_len,
+                    'reduction_percent': round(reduction_pct, 1),
+                    'dict_sizes': {k: len(v) for k, v in dict_maps.items()},
+                    'target_chars': target_chars,
+                    'target_met': enc_len >= target_chars,
+                    'final_k': len(matched_results)
+                }
+            }
+            yield f"data: {json.dumps(meta_enc)}\n\n"
+        except Exception:
+            pass
+        
+        # Decoding instructions for Gemini
+        decoding_rules = """
+COMPACT ENCODING FORMAT (Tokenized) - Decoding Guide:
+- Top-level object: {"dicts": {"K": [...prop keys...], "T": [...labels...], "R": [...rel types...], "D": [...directions...]}, "data": [items...]}
+- Item fields:
+  * L: list of label indices -> lookup in dicts.T
+  * P: map of property-key-index (string) -> value (lookup key index in dicts.K)
+  * C: list of connection objects each with:
+    - L: label indices of neighbor
+    - P: neighbor properties (key index -> value)
+    - r: relationship type index (lookup in dicts.R)
+    - d: direction index (lookup in dicts.D)
+- All indices are integers; values already trimmed.
+- Reconstruct by substituting indices with their dictionary values.
+"""
+        
+        is_counting_query = False #ai_result.get("status") == "counting"
+        if graph_format == "aas":
+            ai_input = (
+                f"{decoding_rules}\n\n"
+                f"Please answer the user query based on the compact-encoded results. IMPORTANT: Results may contain relevant entities at MULTIPLE levels:\n"
+                f"- Top-level items in the data array\n"
+                f"- Connected nodes (C) nested within any item\n"
+                f"You MUST examine ALL levels to find complete answers. Check descriptions in both top-level properties (P) and in connected_nodes properties.\n\n"
+                f"User query: {query_text}\n\nCompact Results:\n{encoded_results}\n"
+            )
+            if is_counting_query:
+                summary, truncated_results = preprocess_results_for_gemini(matched_results, query_text)
+                ai_input = (
+                    f"Please answer the user query accurately based on this data. "
+                    f"CRITICAL: For counting or availability queries, you MUST use the counts from the Summary section below. "
+                    f"The Summary contains ACCURATE recursive counts of all machine instances at all nesting levels. "
+                    f"DO NOT manually count items in the Sample Results - those are truncated for display only.\n\n"
+                    f"User query: {query_text}\n\n"
+                    f"Summary (USE THIS FOR COUNTS):\n{json.dumps(summary, indent=2)}\n\n"
+                    f"Sample Results (for reference only, lists may be truncated):\n{truncated_results}\n"
+                )
+        elif graph_format == "csv":
+            ai_input = f"{decoding_rules}\n\nPlese answer the user query based on the compact-encoded results or correct the results based on user query (each dict in Results list is an item with its attributes).\n\nUser query: {query_text}\n\nCompact Results:\n{encoded_results}\n"
+        else:
+            ai_input = (
+                f"{decoding_rules}\n\n"
+                f"Please answer the user query based on these compact-encoded knowledge graph entities and relationships.\n\n"
+                f"User query: {query_text}\n\n"
+                f"Compact Results (entities and their connections):\n{encoded_results}\n"
+                f"Please be specific and direct in your answer based on the graph data."
+            )
+
+        try:
+            print(ai_input)
+            print(len(matched_results))
+            # Check if user specified a provider override in the request
+            provider_override = data.get('ai_provider') or request.args.get('ai_provider')
+            response = generate_ai_response(ai_input, stream=True, provider=provider_override)
+        except Exception as e:
+            yield f"data: {json.dumps({'error': str(e)})}\n\n"
+            return
+
+        # Handle streaming response from either provider and both OpenAI versions
+        for chunk in response:
+            # Gemini format
+            if hasattr(chunk, 'text') and chunk.text:
+                yield f"data: {json.dumps({'chunk': chunk.text})}\n\n"
+            # OpenAI new format (>=1.0.0)
+            elif hasattr(chunk, 'choices') and chunk.choices:
+                delta = chunk.choices[0].delta
+                if hasattr(delta, 'content') and delta.content:
+                    yield f"data: {json.dumps({'chunk': delta.content})}\n\n"
+            # OpenAI old format (<1.0.0) - dict-based response
+            elif isinstance(chunk, dict) and 'choices' in chunk:
+                delta = chunk['choices'][0].get('delta', {})
+                content = delta.get('content')
+                if content:
+                    yield f"data: {json.dumps({'chunk': content})}\n\n"
+
+    return Response(
+        stream_with_context(generate()),
+        mimetype='text/event-stream',
+        headers={
+            'Connection': 'keep-alive',
+            'X-Accel-Buffering': 'no',
+            'Cache-Control': 'no-cache, no-store, must-revalidate',
+            'Pragma': 'no-cache',
+            'Content-Type': 'text/event-stream'
+        }
+    )
 @app.route('/set-graph-format', methods=['POST'])
 @cross_origin()
 def set_graph_format():
@@ -357,75 +1987,7 @@ def create_graph():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# def run_csv_embedding_generation(queue):
-#     """Background task to generate embeddings for CSV data."""
-#     def update_queue(total, processed):
-#         queue.put({"total": total, "processed": processed})
-    
-#     batch_size = 100
-#     total_query = """
-#     MATCH (a:Asset)
-#     WHERE a.description_embedding IS NULL
-#       AND a.description IS NOT NULL
-#     RETURN count(a) AS total
-#     """
-#     total_result = graph.run(total_query).data()
-#     total_to_process = total_result[0]['total'] if total_result else 0
-#     total_processed = 0
-#     update_queue(total_to_process, total_processed)
-    
-#     while True:
-#         # Fetch batch of assets
-#         query = """
-#         MATCH (a:Asset)
-#         WHERE a.description_embedding IS NULL
-#           AND a.description IS NOT NULL
-#         RETURN a.id AS id, a.description AS description
-#         LIMIT $batch_size
-#         """
-#         assets = graph.run(query, parameters={'batch_size': batch_size}).data()
-#         if not assets:
-#             break
-        
-#         # Process batch embeddings
-#         descriptions = [a['description'] for a in assets if a['description']]
-#         ids = [a['id'] for a in assets if a['description']]
-       
-#         try:
-#             # Generate embeddings for entire batch at once
-#             embeddings = model.encode(descriptions, convert_to_numpy=True)
-           
-#             # Update database in batch
-#             data = [{'id': id, 'embedding': embedding.tolist()}
-#                    for id, embedding in zip(ids, embeddings)]
-           
-#             # Create a new transaction and execute updates
-#             tx = graph.begin()
-#             try:
-#                 for item in tqdm(data, desc="Batches"):
-#                     tx.run("""
-#                     MATCH (a:Asset {id: $id})
-#                     SET a.description_embedding = $embedding
-#                     """, parameters=item)
-#                 tx.commit()
-#             except Exception as e:
-#                 tx.rollback()
-#                 print(f"Transaction failed: {e}")
-#                 continue
-           
-#             total_processed += len(assets)
-#             update_queue(total_to_process, total_processed)
-           
-#         except Exception as e:
-#             print(f"Error processing batch: {e}")
-       
-#         # Small delay to prevent overwhelming the database
-#         time.sleep(0.1)
-#         print(str(total_processed)+"/"+str(total_to_process))
-        
-#     # Clear the queue when done
-#     while not queue.empty():
-#         queue.get()
+
 
 @app.route("/delete-graph", methods=["POST"])
 def delete_graph():
@@ -490,7 +2052,7 @@ def fix_cypher_query(query, cypher_query):
 
     # ✅ Call Gemini for further enrichment
     gemini_input = f"Please fix and improve this Cypher query based on the user query.\nUser query: {query}\nCypher Query: {cypher_query}\n"
-    model = genai.GenerativeModel("gemini-1.5-flash")
+    model = genai.GenerativeModel("gemini-2.0-flash")
     try:
         response = model.generate_content(gemini_input)
         enriched_cypher_query = response.text.strip()
@@ -506,621 +2068,302 @@ def fix_cypher_query(query, cypher_query):
 
 
 
-def run_cypher_query(session, cypher_query, query, params):
-    """Run a Cypher query and return the results as a list."""
-    
+def run_cypher_query(session, cypher_query, query_text, params):
+    """Universal Cypher execution & generic record shaping.
+
+    Features:
+    - Executes provided Cypher with params; retries with light auto-fix if it fails.
+    - Returns list[dict] with primitive JSON-serializable values.
+    - Flattens Neo4j records: converts Nodes -> dict(label, properties), Relationships -> dict(type, start_id, end_id, properties), Paths -> list of segment dicts.
+    - Preserves any existing score / similarity fields if present; adds position-based fallback score otherwise.
+    - Works for any schema (AAS, CSV, RDF, arbitrary) without graph_format branching.
+    """
+    if not cypher_query or not isinstance(cypher_query, str):
+        logging.error("Empty or invalid Cypher query provided to run_cypher_query.")
+        return []
+
+    def _to_plain(value):
+        from neo4j.graph import Node, Relationship, Path
+        if isinstance(value, Node):
+            # Exclude 'embedding' property; include internal id for neighbor enrichment
+            return {
+                "_type": "node",
+                "id": value.id,
+                "labels": list(value.labels),
+                **{k: value.get(k) for k in value.keys() if k != 'embedding'}
+            }
+        if isinstance(value, Relationship):
+            return {
+                "_type": "relationship",
+                "rel_type": value.type,
+                "start_id": value.start_node.id,
+                "end_id": value.end_node.id,
+                **{k: value.get(k) for k in value.keys() if k != 'embedding'}
+            }
+        if isinstance(value, Path):
+            segments = []
+            for rel in value.relationships:
+                segments.append(_to_plain(rel))
+            return {"_type": "path", "segments": segments}
+        if isinstance(value, list):
+            return [_to_plain(v) for v in value]
+        if isinstance(value, dict):
+            return {k: _to_plain(v) for k, v in value.items() if k != 'embedding'}
+        return value
+
     try:
-        logging.info(f"Running Cypher query: {cypher_query}")
-        results = session.run(cypher_query, **params)
+        logging.info(f"Running Cypher query:\n{cypher_query}")
+        result_cursor = session.run(cypher_query, **params)
     except Exception as e:
-        logging.error(f"Error running Cypher query: {e}")
-        
-        # Attempt to fix the query if it fails
-        logging.info("Attempting to fix the Cypher query...")
-        fixed_cypher_query = fix_cypher_query(query, cypher_query)
-        logging.info(f"Fixed Cypher query: {fixed_cypher_query}")
-        
-        try:
-            results = session.run(fixed_cypher_query, **params)
-        except Exception as retry_error:
-            logging.error(f"Failed after retry: {retry_error}")
+        logging.error(f"Primary Cypher execution failed: {e}")
+        fixed = fix_cypher_query(query_text, cypher_query) if cypher_query else None
+        if fixed and fixed != cypher_query:
+            try:
+                logging.info("Retrying with auto-fixed Cypher")
+                result_cursor = session.run(fixed, **params)
+            except Exception as ee:
+                logging.error(f"Retry with fixed query failed: {ee}")
+                return []
+        else:
             return []
 
-    results_list = []
-    
-    
-    for result in results:
-        if graph_format == "aas":
-            asset = {
-                "id": result.get("id"),
-                "name": result.get("name", "No name"),
-                "description": result.get("description", "No description"),
-                "manufacturer": result.get("manufacturer", "Unknown manufacturer"),
-                "energy_consumption": result.get("energy_consumption", "No energy consumption data"),
-                "drilling": result.get("drilling", "No drilling data"),
-                "circle_cutting": result.get("circle_cutting", "No circle cutting data"),
-                "sawing": result.get("sawing", "No sawing data"),
-                "availability": result.get("availability", "Unknown availability"),
-                "score": result.get("score", 0.0),
-                "connected_models": result.get("connected_models", [])  
-            }
-            results_list.append(asset)
-        
-        elif graph_format == "csv":
-            product = {
-                "uniq_id": result.get("uniq_id"),
-                "name": result.get("name", "No name"),
-                "description": result.get("description", "No description"),
-                "description_complete": result.get("description_complete", "No detailed description"),
-                "price": result.get("price", "N/A"),
-                "currency": result.get("currency", "N/A"),
-                "review_count": result.get("review_count", 0),
-                "review_rating": result.get("review_rating", 0),
-                "stock_type": result.get("stock_type", "N/A"),
-                "score": result.get("score", 0.0)
-            }
-            results_list.append(product)
-        
-        # elif graph_format == "rdf":
+    records = []
+    node_ids = set()
+    for idx, record in enumerate(result_cursor):
+        plain = {}
+        for key in record.keys():
+            val_plain = _to_plain(record.get(key))
+            plain[key] = val_plain
+            # Collect node ids for neighbor enrichment
+            if isinstance(val_plain, dict) and val_plain.get('_type') == 'node' and 'id' in val_plain:
+                node_ids.add(val_plain['id'])
+            elif isinstance(val_plain, list):
+                for item in val_plain:
+                    if isinstance(item, dict) and item.get('_type') == 'node' and 'id' in item:
+                        node_ids.add(item['id'])
+        # Provide fallback score if none present
+        if 'score' not in plain and 'similarity' in plain and isinstance(plain['similarity'], (int, float)):
+            plain['score'] = plain['similarity']
+        if 'score' not in plain:
+            plain['score'] = max(0.0, 1.0 - (idx * 0.01))  # mild decay
+        records.append(plain)
 
-        #     # Enhanced RDF entity structure with comprehensive relationship mapping
-        #     entity = {
-        #         "entity1": result.get("entity1", "No entity1"),
-        #         "entity2": result.get("entity2", ""),
-        #         "entity3": result.get("entity3", ""),
-        #         "relationship1": result.get("relationship1", ""),
-        #         "relationship2": result.get("relationship2", ""),
-        #         "score": result.get("score", 0.0),
-        #         "connections": []  # To store related entities
-        #     }
-            
-        #     # Add direct connections
-        #     if result.get("entity2") and result.get("relationship1"):
-        #         entity["connections"].append({
-        #             "from": result.get("entity1"),
-        #             "relationship": result.get("relationship1"),
-        #             "to": result.get("entity2")
-        #         })
-                
-        #     if result.get("entity2") and result.get("entity3") and result.get("relationship2"):
-        #         entity["connections"].append({
-        #             "from": result.get("entity2"),
-        #             "relationship": result.get("relationship2"),
-        #             "to": result.get("entity3")
-        #         })
-            
-        #     # Add additional connections if present
-        #     if result.get("additional_connections"):
-        #         for conn in result.get("additional_connections"):
-        #             if isinstance(conn, dict) and conn.get("node") and conn.get("relationship"):
-        #                 entity["connections"].append({
-        #                     "from": result.get("entity1"),
-        #                     "relationship": conn.get("relationship"),
-        #                     "to": conn.get("node")
-        #                 })
-            
-        #     # Add incoming connections if present
-        #     if result.get("incoming_connections"):
-        #         for conn in result.get("incoming_connections"):
-        #             if isinstance(conn, dict) and conn.get("source") and conn.get("relationship"):
-        #                 entity["connections"].append({
-        #                     "from": conn.get("source"),
-        #                     "relationship": conn.get("relationship"),
-        #                     "to": result.get("entity1")
-        #                 })
-            
-        #     # Add context connections if present (for maximum relaxation queries)
-        #     if result.get("context_connections"):
-        #         for conn in result.get("context_connections"):
-        #             if isinstance(conn, dict) and conn.get("source") and conn.get("relationship") and conn.get("target"):
-        #                 entity["connections"].append({
-        #                     "from": conn.get("source"),
-        #                     "relationship": conn.get("relationship"),
-        #                     "to": conn.get("target")
-        #                 })
-            
-        #     results_list.append(entity)
-            
-    logging.info(f"Fetched {len(results_list)} results")
-    return results_list
+    # Enrich each node with its first-degree connected nodes' properties (excluding embeddings)
+    neighbors_map = {}
+    if node_ids:
+        try:
+            neighbor_query = """
+            MATCH (n) WHERE elementId(n) IN $ids
+            OPTIONAL MATCH (n)--(m)
+            WITH n, collect(DISTINCT m)[0..5] AS ms
+            RETURN elementId(n) AS id, ms
+            """
+            neighbor_results = session.run(neighbor_query, ids=list(node_ids))
+            for nr in neighbor_results:
+                raw_list = nr.get('ms') or []
+                cleaned = []
+                for m in raw_list:
+                    if m is None:
+                        continue
+                    try:
+                        props = {k: v for k, v in dict(m).items() if k != 'embedding'}
+                        cleaned.append({
+                            'id': m.id,
+                            'labels': list(m.labels),
+                            **props
+                        })
+                    except Exception:
+                        continue
+                neighbors_map[nr.get('id')] = cleaned
+        except Exception as ne:
+            logging.warning(f"Neighbor enrichment failed: {ne}")
+
+    if neighbors_map:
+        for rec in records:
+            for key, val in list(rec.items()):
+                if isinstance(val, dict) and val.get('_type') == 'node' and 'id' in val:
+                    val['connected_nodes'] = neighbors_map.get(val['id'], [])
+                elif isinstance(val, list):
+                    for item in val:
+                        if isinstance(item, dict) and item.get('_type') == 'node' and 'id' in item:
+                            item['connected_nodes'] = neighbors_map.get(item['id'], [])
+  
+
+    logging.info(f"Fetched {len(records)} results (universal)")
+    return records
 
 def fuzzy_match_results(results, query_text):
-    """Fuzzy match the results to the query text based on various fields."""
-    enriched_results = []
-    
-    for result in results:
-        # Calculate similarity scores for different fields
-        if graph_format == "aas":
-            name_similarity = fuzz.partial_ratio(query_text.lower(), result.get("name", "").lower())
-            desc_similarity = fuzz.partial_ratio(query_text.lower(), result.get("description", "").lower())
-            manufacturer_similarity = fuzz.partial_ratio(query_text.lower(), result.get("manufacturer", "").lower())
-            
-            # Calculate similarities for technical specifications
-            tech_specs = [
-                result.get("energy_consumption", ""),
-                result.get("drilling", ""),
-                result.get("circle_cutting", ""),
-                result.get("sawing", ""),
-                result.get("available", "")
-            ]
-            
-            tech_similarities = [
-                fuzz.partial_ratio(query_text.lower(), spec.lower())
-                for spec in tech_specs if spec
-            ]
-            
-            # Get the maximum similarity across all fields
-            all_similarities = [name_similarity, desc_similarity, manufacturer_similarity] + tech_similarities
-            max_similarity = max(all_similarities) if all_similarities else 0
-            
-            # Add similarity score to the result
-            result["similarity"] = max_similarity
-            enriched_results.append(result)
-        
-        elif graph_format == "csv":
-            name_similarity = fuzz.partial_ratio(query_text.lower(), result.get("name", "").lower())
-            description_similarity = fuzz.partial_ratio(query_text.lower(), result.get("description", "").lower())
-            max_similarity = max(name_similarity, description_similarity)
+    """Universal fuzzy matching for heterogeneous Neo4j query outputs.
 
-            # Retain all fields and add similarity
-            result["similarity"] = max_similarity
-            enriched_results.append(result)
-        
-        # elif graph_format == "rdf":
-        #     # Enhanced similarity calculation for RDF entities
-        #     entity1_similarity = fuzz.partial_ratio(query_text.lower(), result.get("entity1", "").lower())
-        #     entity2_similarity = fuzz.partial_ratio(query_text.lower(), result.get("entity2", "").lower()) if result.get("entity2") else 0
-        #     entity3_similarity = fuzz.partial_ratio(query_text.lower(), result.get("entity3", "").lower()) if result.get("entity3") else 0
-            
-        #     # Include relationship similarity for better matching
-        #     rel1_similarity = fuzz.partial_ratio(query_text.lower(), result.get("relationship1", "").lower()) if result.get("relationship1") else 0
-        #     rel2_similarity = fuzz.partial_ratio(query_text.lower(), result.get("relationship2", "").lower()) if result.get("relationship2") else 0
-            
-        #     # Add connection similarity checking
-        #     connection_similarities = []
-        #     for conn in result.get("connections", []):
-        #         if isinstance(conn, dict):
-        #             conn_from = fuzz.partial_ratio(query_text.lower(), conn.get("from", "").lower())
-        #             conn_to = fuzz.partial_ratio(query_text.lower(), conn.get("to", "").lower())
-        #             conn_rel = fuzz.partial_ratio(query_text.lower(), conn.get("relationship", "").lower())
-        #             connection_similarities.append(max(conn_from, conn_to, conn_rel))
-            
-        #     # Get maximum similarity across all fields
-        #     all_similarities = [entity1_similarity, entity2_similarity, entity3_similarity, rel1_similarity, rel2_similarity]
-        #     if connection_similarities:
-        #         all_similarities.append(max(connection_similarities))
-            
-        #     max_similarity = max(all_similarities)
-            
-        #     # Boost scores for production/consumption queries
-        #     if any(word in query_text.lower() for word in ["produce", "produces", "producing", "production"]):
-        #         if "PRODUCES" in str(result):
-        #             max_similarity += 15
-            
-        #     if any(word in query_text.lower() for word in ["consume", "consumes", "consuming", "consumption"]):
-        #         if "CONSUMES" in str(result):
-        #             max_similarity += 15
-            
-        #     # Add similarity score to the result
-        #     result["similarity"] = max_similarity
-        #     enriched_results.append(result)
+    Strategy:
+      1. Identify candidate text fields automatically (string values, excluding ids & embeddings).
+      2. Compute fuzzy partial ratios against the user query for each candidate.
+      3. Derive a composite similarity (max + small boost if multiple semi-matches).
+      4. If nested structures (connected_nodes, neighbors, paths) exist, include their textual fields.
+      5. Preserve existing numeric score/similarity if present; keep both (original under 'orig_score').
 
-    # Sort by similarity score
-    return sorted(enriched_results, key=lambda x: x["similarity"], reverse=True)
+    Returns list sorted descending by similarity.
+    """
+    if not query_text or not isinstance(query_text, str) or not results:
+        return results
 
-def relax_cypher_query(cypher_query, relaxation_level, query_text):
-    """Relax the Cypher query progressively to increase recall while maintaining relevance."""
-    if graph_format == "aas":
-        if relaxation_level == 0:
-            # Base query - no relaxation
-            return cypher_query
+    ql = query_text.lower()
 
-        elif relaxation_level == 1:
-            # 1️⃣ Lower similarity slightly + Increase result count
-            relaxed_query = re.sub(r"WHERE similarity > \d+\.\d+", "WHERE similarity > 0.3", cypher_query)
-            relaxed_query = re.sub(r"LIMIT \$(n|limit)", "LIMIT 20", relaxed_query)
+    def iter_texts(obj):
+        """Yield textual snippets from arbitrary nested result structures."""
+        if obj is None:
+            return
+        if isinstance(obj, str):
+            txt = obj.strip()
+            if txt and len(txt) < 2000:  # ignore huge blobs
+                yield txt
+        elif isinstance(obj, dict):
+            for k, v in obj.items():
+                lk = k.lower()
+                # Skip obvious non-text / embedding / ids
+                if lk in {"embedding", "id", "_id"} or lk.endswith("_embedding") or lk.startswith("embedding"):
+                    continue
+                if isinstance(v, (str, list, dict)):
+                    for sub in iter_texts(v):
+                        yield sub
+        elif isinstance(obj, list):
+            for item in obj:
+                for sub in iter_texts(item):
+                    yield sub
 
-        elif relaxation_level == 2:
-            # 2️⃣ Remove strict similarity filter & add keyword-based filtering
-            relaxed_query = re.sub(r"WHERE similarity > \d+\.\d+", "", cypher_query)
-            relaxed_query = relaxed_query.replace("ORDER BY similarity DESC", "")
+    enriched = []
+    for r in results:
+        try:
+            texts = list(iter_texts(r))
+            seen = set()
+            dedup_texts = []
+            for t in texts:
+                tl = t.lower()
+                if tl not in seen:
+                    seen.add(tl)
+                    dedup_texts.append(t)
 
-        elif relaxation_level == 3:
-            # 3️⃣ Remove unnecessary relationships & return more related assets
-            relaxed_query = """
-            MATCH (a:Asset)
-            OPTIONAL MATCH (a)-[:MANUFACTURED_BY]->(m:Manufacturer)
-            OPTIONAL MATCH (a)-[:HAS_ENERGY_CONSUMPTION]->(e:EnergyConsumption)
-            OPTIONAL MATCH (a)-[:HAS_DRILLING]->(d:Drilling)
-            OPTIONAL MATCH (a)-[:HAS_CIRCLE_CUTTING]->(c:CircleCutting)
-            OPTIONAL MATCH (a)-[:HAS_SAWING]->(s:Sawing)
-            OPTIONAL MATCH (a)-[:HAS_AVAILABILITY]->(v:Availability)
-            RETURN 
-                a.id AS id,
-                a.idShort AS name,
-                a.description AS description,
-                m.name AS manufacturer,
-                e.details AS energy_consumption,
-                d.details AS drilling,
-                c.details AS circle_cutting,
-                s.details AS sawing,
-                v.details AS available,
-                0.15 AS score, [] AS connected_subassets
-            ORDER BY score DESC
-            LIMIT 20
-            """
-
-        elif relaxation_level == 4:
-            # 4️⃣ Include indirectly related assets
-            relaxed_query = """
-            MATCH (a:Asset)
-            OPTIONAL MATCH (a)-[:MANUFACTURED_BY]->(m:Manufacturer)
-            OPTIONAL MATCH (a)-[:HAS_ENERGY_CONSUMPTION]->(e:EnergyConsumption)
-            OPTIONAL MATCH (a)-[:HAS_DRILLING]->(d:Drilling)
-            OPTIONAL MATCH (a)-[:HAS_CIRCLE_CUTTING]->(c:CircleCutting)
-            OPTIONAL MATCH (a)-[:HAS_SAWING]->(s:Sawing)
-            OPTIONAL MATCH (a)-[:HAS_AVAILABILITY]->(v:Availability)
-            OPTIONAL MATCH (a)-[:RELATED_TO]->(r:Asset)
-            RETURN 
-                a.id AS id,
-                a.idShort AS name,
-                a.description AS description,
-                m.name AS manufacturer,
-                e.details AS energy_consumption,
-                d.details AS drilling,
-                c.details AS circle_cutting,
-                s.details AS sawing,
-                v.details AS available,
-                0.1 AS score, collect(r.idShort) AS connected_subassets
-            ORDER BY score DESC
-            LIMIT 30
-            """
-
-        else:
-            # 5️⃣ Maximum relaxation - get everything without filters
-            relaxed_query = """
-            MATCH (a:Asset)
-            RETURN a.id AS id, a.idShort AS name, a.description AS description,
-                "" AS manufacturer, "" AS energy_consumption,
-                "" AS drilling, "" AS circle_cutting, "" AS sawing,
-                0.05 AS score, [] AS connected_subassets
-            ORDER BY score DESC
-            LIMIT 50
-            """
-    
-    elif graph_format == "csv":
-        if relaxation_level == 1:
-        # Remove exact name matching, broaden to partial description matching
-            relaxed_query = re.sub(
-                r"AND toLower\(p\.name\) CONTAINS toLower\('.*?'\)",
-                "",
-                cypher_query
-            )
-        elif relaxation_level == 2:
-            # Remove all name-based filters; match only on embeddings
-            relaxed_query = re.sub(
-                r"WHERE similarity > 0.*",
-                "WHERE similarity > 0",
-                cypher_query,
-                flags=re.DOTALL
-            )
-        elif relaxation_level == 3:
-            # Lower the similarity threshold
-            relaxed_query = cypher_query.replace("WHERE similarity > 0", "WHERE similarity >= 0.5")
-        else:
-            # If no relaxation is needed or nothing to relax, return as is
-            relaxed_query = cypher_query
-    
-    # elif graph_format == "rdf":
-    #     # Improved RDF format relaxation
-    #     if relaxation_level == 1:
-    #         # Lower similarity threshold
-    #         relaxed_query = re.sub(r"WHERE similarity > 0.4", "WHERE similarity > 0.2", cypher_query)
-    #     elif relaxation_level == 2:
-    #         # Remove similarity filter entirely
-    #         relaxed_query = re.sub(r"WHERE similarity > \d+\.\d+", "", cypher_query)
-    #     elif relaxation_level == 3:
-    #         # Expand relationship search to include more context
-    #         relaxed_query = """
-    #         MATCH (e1:Entity)
-    #         WHERE toLower(e1.name) CONTAINS toLower($query_text) OR $query_text CONTAINS toLower(e1.name)
-            
-    #         // Get connected entities and their relations
-    #         MATCH paths = (e1)-[r1]->(e2:Entity)
-    #         OPTIONAL MATCH extended = (e2)-[r2]->(e3:Entity)
-            
-    #         // Add reverse direction paths for completeness
-    #         OPTIONAL MATCH reverse_paths = (e4:Entity)-[r3]->(e1)
-            
-    #         RETURN 
-    #             e1.name AS entity1,
-    #             type(r1) AS relationship1,
-    #             e2.name AS entity2,
-    #             type(r2) AS relationship2,
-    #             e3.name AS entity3,
-    #             0.3 AS score,
-    #             collect({source: e4.name, relationship: type(r3), direction: 'incoming'}) AS incoming_connections
-    #         LIMIT 20
-    #         """
-    #     else:
-    #         # Maximum relaxation - context-aware query focusing on specific relationships
-    #         keywords = query_text.lower().split()
-    #         production_related = any(word in keywords for word in ['produce', 'produces', 'production', 'manufacturing', 'makes', 'made', 'create'])
-    #         consumption_related = any(word in keywords for word in ['consume', 'consumes', 'consumption', 'uses', 'used', 'utilizing', 'requires'])
-            
-    #         relationship_focus = "PRODUCES" if production_related else "CONSUMES" if consumption_related else ""
-            
-    #         relaxed_query = f"""
-    #         // First find entities mentioned in the query
-    #         MATCH (e:Entity)
-    #         WHERE toLower(e.name) CONTAINS toLower($query_text) OR any(word IN split(toLower($query_text), ' ') WHERE toLower(e.name) CONTAINS word)
-            
-    #         // Then find relationships that match the query intent
-    #         WITH e
-    #         OPTIONAL MATCH (e)-[r1]->(target:Entity)
-    #         {f"WHERE type(r1) CONTAINS '{relationship_focus}'" if relationship_focus else ""}
-            
-    #         // Also check reverse relationships
-    #         OPTIONAL MATCH (source:Entity)-[r2]->(e)
-    #         {f"WHERE type(r2) CONTAINS '{relationship_focus}'" if relationship_focus else ""}
-            
-    #         // Return comprehensive connection information
-    #         RETURN 
-    #             e.name AS entity1,
-    #             type(r1) AS relationship1,
-    #             target.name AS entity2,
-    #             "" AS relationship2,
-    #             "" AS entity3,
-    #             0.1 AS score,
-    #             collect(DISTINCT {{source: source.name, relationship: type(r2), target: e.name}}) AS context_connections
-    #         ORDER BY score DESC
-    #         LIMIT 25
-    #         """
-
-    logging.info(f"Relaxed query (level {relaxation_level}): {relaxed_query}")
-    return relaxed_query
-
-
-
-from flask import Flask, request, jsonify, Response, stream_with_context
-from flask_cors import CORS
-import json
-
-
-
-@app.route('/semantic-search', methods=['POST'])
-def semantic_search():
-    """API endpoint for performing semantic search with streaming response."""
-    try:
-        data = request.json
-        query_text = data.get('query', '')
-        n_results = data.get('n', 10)
-
-        query_text = query_text["output"]
-        print(query_text)
-        if not query_text:
-            return jsonify({"error": "Query text is required"}), 400
-        
-        #graph_format = request.form.get('graphFormat') or request.json.get('graphFormat', 'rdf')
-        print(graph_format)
-
-        if graph_format == "rdf":
-            return fix_semantic_search_for_rdf(data)
-
-        def generate():
-            try:
-                # Step 1: Get the query embedding
-                query_embedding = get_embedding(query_text)
-                if not query_embedding:
-                    yield "data: " + json.dumps({"error": "Failed to get query embedding"}) + "\n\n"
-                    return
-
-                # Step 2: Base Cypher query for asset search
-                if graph_format == "aas":
-                    base_cypher_query = """
-                    MATCH (a:Asset)
-                    WHERE a.embedding IS NOT NULL
-                    WITH a, 
-                    REDUCE(dot = 0.0, i IN RANGE(0, SIZE(a.embedding)-1) | 
-                        dot + a.embedding[i] * $embedding[i]
-                    ) / (
-                        SQRT(REDUCE(norm1 = 0.0, i IN RANGE(0, SIZE(a.embedding)-1) | 
-                            norm1 + a.embedding[i] * a.embedding[i]
-                        )) * 
-                        SQRT(REDUCE(norm2 = 0.0, i IN RANGE(0, SIZE($embedding)-1) | 
-                            norm2 + $embedding[i] * $embedding[i]
-                        ))
-                    ) AS similarity
-                    WHERE similarity > 0.6
-
-                    OPTIONAL MATCH (a)-[:MANUFACTURED_BY]->(m:Manufacturer)
-                    OPTIONAL MATCH (a)-[:HAS_ENERGY_CONSUMPTION]->(e:EnergyConsumption)
-                    OPTIONAL MATCH (a)-[:HAS_DRILLING]->(d:Drilling)
-                    OPTIONAL MATCH (a)-[:HAS_CIRCLE_CUTTING]->(c:CircleCutting)
-                    OPTIONAL MATCH (a)-[:HAS_SAWING]->(s:Sawing)
-                    OPTIONAL MATCH (a)-[:HAS_AVAILABILITY]->(v:Availability)
-
-                    OPTIONAL MATCH (instance)-[:HAS_MODEL]->(a)
-                    OPTIONAL MATCH (instance)-[:HAS_ENERGY_CONSUMPTION]->(inst_e:EnergyConsumption)
-                    OPTIONAL MATCH (instance)-[:HAS_DRILLING]->(inst_d:Drilling)
-                    OPTIONAL MATCH (instance)-[:HAS_CIRCLE_CUTTING]->(inst_c:CircleCutting)
-                    OPTIONAL MATCH (instance)-[:HAS_SAWING]->(inst_s:Sawing)
-                    OPTIONAL MATCH (instance)-[:HAS_AVAILABILITY]->(inst_v:Availability)
-
-                    RETURN 
-                        a.id AS id,
-                        a.idShort AS name,
-                        a.description AS description,
-                        m.name AS manufacturer,
-                        e.details AS energy_consumption,
-                        d.details AS drilling,
-                        c.details AS circle_cutting,
-                        s.details AS sawing,
-                        v.status AS availability,
-                        similarity AS score,
-                        COLLECT(DISTINCT {
-                            id: instance.id, 
-                            name: instance.idShort, 
-                            energy_consumption: inst_e.details,
-                            drilling: inst_d.details,
-                            circle_cutting: inst_c.details,
-                            sawing: inst_s.details,
-                            availability: inst_v.status
-                        }) AS connected_models
-                    ORDER BY similarity DESC
-                    LIMIT $n
-                    """
-                elif graph_format == "csv":
-                    base_cypher_query = """
-                    MATCH (p:Product)
-                    WHERE p.description_embedding IS NOT NULL
-                    WITH p,
-                        reduce(dot = 0.0, i in range(0, size(p.description_embedding)-1) |
-                        dot + p.description_embedding[i] * $embedding[i]) / 
-                        (sqrt(reduce(a = 0.0, i in range(0, size(p.description_embedding)-1) |
-                        a + p.description_embedding[i] * p.description_embedding[i])) *
-                        sqrt(reduce(b = 0.0, i in range(0, size($embedding)-1) |
-                        b + $embedding[i] * $embedding[i])))
-                        AS similarity
-                    WHERE similarity > 0
-                    RETURN 
-                        p.uniq_id AS uniq_id,
-                        p.name AS name,
-                        p.description AS description,
-                        p.description_complete AS description_complete,
-                        p.price AS price,
-                        p.currency AS currency,
-                        p.review_count AS review_count,
-                        p.review_rating AS review_rating,
-                        p.stock_type AS stock_type,
-                        similarity AS score
-                    ORDER BY similarity DESC
-                    LIMIT $n
-                    """
-                
-                # Step 3: Generate enriched Cypher query using Gemini
-                enriched_cypher_query = generate_enriched_cypher(query_text, base_cypher_query)
-
-                # Step 4: Run the query and handle results
-                results_list = []
-                with driver.session() as session:
-                    results_list = run_cypher_query(session, enriched_cypher_query, query_text,
-                                                  {"embedding": query_embedding, "n": n_results})
-                    logging.info(f"Fetched {len(results_list)} results")
-                    if graph_format == "aas":# or graph_format == "rdf":
-                        # If no results, try relaxing the query
-                        if len(results_list) < 5:
-                            
-                            relaxation_level = 0
-                            max_iterations = 5
-                            results_list = []
-
-                            while relaxation_level < max_iterations:
-                                logging.info(f"Relaxing search: level {relaxation_level}...")
-                                relaxed_cypher_query = relax_cypher_query(base_cypher_query, relaxation_level, query_text)
-                                
-                                results_list = run_cypher_query(session, relaxed_cypher_query, query_text,
-                                                                {"embedding": query_embedding, "n": 10})
-                                
-                                if len(results_list) > 5:
-                                    break
-                                relaxation_level += 1
-
-                            if relaxation_level >= max_iterations:
-                                logging.warning("Reached maximum iterations while trying to relax the query.")
-
-                    elif graph_format == "csv":
-                        if not results_list:
-                            relaxation_level = 0
-                            max_iterations = 5
-                            while relaxation_level < max_iterations:
-                                logging.info(f"Attempt {relaxation_level + 1}: Running relaxed query...")
-                                relaxed_cypher_query = relax_cypher_query(base_cypher_query, relaxation_level, query_text)
-                                results_list = run_cypher_query(session, relaxed_cypher_query, {"embedding": query_embedding, "n": n_results, "query_text": query_text})
-                                logging.info(f"Fetched {len(results_list)} results")
-                                if results_list:
-                                    break
-                                relaxation_level += 1
-
-                            if relaxation_level >= max_iterations:
-                                logging.warning("Reached maximum iterations while trying to relax the query.")
-                    
-
-                # Step 5: Fuzzy match results
-                matched_results = fuzzy_match_results(results_list, query_text)
-                
-                # Debug logging
-                print(query_text)
+            similarities = []
+            for t in dedup_texts:
                 try:
-                    print("relaxed: ", relaxed_cypher_query)
-                except:
-                    print("enriched: ", enriched_cypher_query)
+                    sim = fuzz.partial_ratio(ql, t.lower())
+                    similarities.append(sim)
+                except Exception:
+                    continue
 
-                # Step 6: Stream the enriched response
-                model = genai.GenerativeModel("gemini-1.5-flash")
-                
-                # Determine if this is a counting-related query
-                if graph_format == "aas":
-                    is_counting_query = any(word in query_text.lower() for word in 
-                                        ["count", "how many", "number of", "total"])#, "available", "unavailable"])
-                
-                if graph_format == "aas":
-                    # For non-counting queries, use the direct approach from the second version
-                    gemini_input = (
-                        f"Please answer the user query based on the list of results (each dict in Results list "
-                        f"is an item with its attributes, note that connected_models are machines themselves).\n\n"
-                        f"User query: {query_text}\nResults:\n{matched_results}\n"
-                    )
-                    
-                    if is_counting_query:
-                        # Use the preprocess_results_for_gemini function for counting queries
-                        summary, truncated_results = preprocess_results_for_gemini(matched_results, query_text)
-                        
-                        # Prepare a more structured input for Gemini
-                        gemini_input = (
-                            f"Please answer the user query accurately based on this data. "
-                            f"Pay special attention to counts and availability information in the summary.\n\n"
-                            f"User query: {query_text}\n\n"
-                            f"Summary:\n{json.dumps(summary, indent=2)}\n\n"
-                            f"Sample Results (some lists may be truncated):\n{truncated_results}\n"
-                        )
-                elif graph_format == "csv":
-                    gemini_input = f"Plese answer the user query based on the results or correct the results based on user query (each dict in Results list is an item with its attributes).\n\nUser query: {query_text}\nResults:\n{matched_results}\n"
-                
-                else:
-                    gemini_input = (
-                        f"Please answer the user query based on these knowledge graph entities and relationships.\n\n"
-                        f"User query: {query_text}\n\n"
-                        f"Results (entities and their connections):\n{matched_results}\n"
-                        f"Please be specific and direct in your answer based on the graph data."
-                    )
-                
-                print(matched_results)
-                print(gemini_input)
-                
-                response = model.generate_content(gemini_input, stream=True)
-                print(response)
-                for chunk in response:
-                    if chunk.text:
-                        yield f"data: {json.dumps({'chunk': chunk.text})}\n\n"
+            if similarities:
+                max_sim = max(similarities)
+                # Boost: count of medium matches (>=50) adds small fraction
+                medium = sum(1 for s in similarities if 50 <= s < max_sim)
+                composite = max_sim + min(10, medium * 2)
+            else:
+                composite = 0
 
-            except Exception as e:
-                yield f"data: {json.dumps({'error': str(e)})}\n\n"
+            # Preserve original score if present
+            if 'score' in r and 'orig_score' not in r:
+                r['orig_score'] = r['score']
+            r['similarity'] = composite
 
-        return Response(
-            stream_with_context(generate()),
-            mimetype='text/event-stream',
-            headers={
-                'Connection': 'keep-alive',
-                'X-Accel-Buffering': 'no',
-                'Cache-Control': 'no-cache, no-store, must-revalidate',  # Disable caching
-                'Pragma': 'no-cache',
-                'Content-Type': 'text/event-stream'
-            }
-        )
+            enriched.append(r)
+        except Exception as e:
+            logging.warning(f"fuzzy_match_results skipped a record due to error: {e}")
+            continue
 
-    except Exception as e:
-        return jsonify({"error": f"Internal server error: {str(e)}"}), 500
+    # Sort by similarity (fallback to existing score if similarity ties)
+    return sorted(
+        enriched,
+        key=lambda x: (x.get('similarity', 0), x.get('score', 0)),
+        reverse=True
+    )
+
+
+def relax_cypher_query(cypher_query: str, relaxation_level: int, query_text: str) -> str:
+    """Schema-agnostic Cypher relaxation with improved syntax handling."""
+    import re, math
+    if not cypher_query or not isinstance(cypher_query, str):
+        return cypher_query
+
+    original = cypher_query
+    working = cypher_query
+
+    # Utility: modify LIMIT - fix duplicate LIMIT issues
+    def bump_limit(q: str, factor: float = 2.0, floor: int = 20, cap: int = 200) -> str:
+        def repl(m):
+            num = int(m.group(1))
+            new_num = min(cap, max(floor, math.ceil(num * factor)))
+            return f"LIMIT {new_num}"
+        
+        # First replace existing LIMIT
+        if re.search(r"LIMIT\s+(\d+)", q, flags=re.IGNORECASE):
+            return re.sub(r"LIMIT\s+(\d+)", repl, q, flags=re.IGNORECASE)
+        elif re.search(r"LIMIT\s+\$[a-zA-Z_][a-zA-Z0-9_]*", q, flags=re.IGNORECASE):
+            # Replace parameter-based LIMIT  
+            return re.sub(r"LIMIT\s+\$[a-zA-Z_][a-zA-Z0-9_]*", f"LIMIT {floor}", q, flags=re.IGNORECASE)
+        else:
+            # If no LIMIT, append one
+            return q.rstrip() + f"\nLIMIT {floor}"
+
+    # Utility: lower similarity threshold
+    def soften_similarity(q: str, min_floor: float = 0.05) -> str:
+        pattern = r"WHERE\s+similarity\s*>\s*(\d+\.\d+|\d+)"
+        def repl(m):
+            val = float(m.group(1))
+            new_val = max(min_floor, round(val * 0.6, 3))
+            return f"WHERE similarity > {new_val}"
+        return re.sub(pattern, repl, q, flags=re.IGNORECASE)
+
+    # Utility: remove similarity threshold
+    def drop_similarity(q: str) -> str:
+        return re.sub(r"WHERE\s+similarity\s*>\s*(\d+\.\d+|\d+)", "", q, flags=re.IGNORECASE)
+
+    # Utility: soften strict equality filters of form n.prop = 'literal'
+    def soften_equals(q: str) -> str:
+        def repl(m):
+            left = m.group(1)
+            lit = m.group(2)
+            return f"toLower({left}) CONTAINS toLower('{lit}')"
+        return re.sub(r"([A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*)\s*=\s*'([^']+)'", repl, q)
+
+    # Utility: remove label spec e.g. (n:Label) -> (n)
+    def drop_labels(q: str) -> str:
+        return re.sub(r"\(([a-zA-Z_][A-Za-z0-9_]*):[A-Za-z_][A-Za-z0-9_]*(?::[A-Za-z_][A-Za-z0-9_]*)*\)", r"(\1)", q)
+
+    # Utility: prune simple property predicates
+    def prune_property_filters(q: str) -> str:
+        q = re.sub(r"AND\s+[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*\s*=\s*'[^']*'", "", q)
+        q = re.sub(r"AND\s+[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*\s+IN\s+\[[^\]]*\]", "", q)
+        q = re.sub(r"WHERE\s+AND", "WHERE", q)
+        q = re.sub(r"\s{2,}", " ", q)
+        return q
+
+    # Store evolution for logging if needed
+    if relaxation_level <= 0:
+        logging.info("Relaxation level 0: returning original query")
+        return original
+
+    if relaxation_level >= 1:
+        working = soften_similarity(working)
+        working = bump_limit(working, factor=1.5, floor=20)
+
+    if relaxation_level >= 2:
+        working = drop_similarity(working)
+        working = soften_equals(working)
+
+    if relaxation_level >= 3:
+        working = drop_labels(working)
+        working = prune_property_filters(working)
+        working = bump_limit(working, factor=2.0, floor=40, cap=300)
+
+    if relaxation_level >= 4:
+        # Simplified neighbor expansion - just boost the limit more aggressively
+        working = bump_limit(working, factor=1.5, floor=60, cap=400)
+
+    if relaxation_level >= 5:
+        # Final aggressive broadening: remove ORDER BY similarity if present
+        working = re.sub(r"ORDER BY\s+similarity\s+DESC", "", working, flags=re.IGNORECASE)
+
+    logging.info(f"Relaxed query (level {relaxation_level}):\n{working}")
+    return working
 
 
 
@@ -1347,46 +2590,105 @@ def preprocess_results_for_gemini(matched_results, query_text):
     especially for counting-type operations
     """
     if graph_format == "aas":
+        
+        # Determine the equipment type from the top-level results to filter instances
+        # Only count instances that match the queried equipment type
+        equipment_types = set()
+        for item in matched_results:
+            labels = item.get("labels", [])
+            # Check for equipment type labels (Drilling, CircleCutting, Sawing, etc.)
+            for label in labels:
+                if label in ["Drilling", "CircleCutting", "Sawing", "Milling", "Grinding", "Welding"]:
+                    equipment_types.add(label)
+        
+        # Helper function to recursively count nodes with availability info at all nesting levels
+        def count_nodes_recursive(item, visited=None, parent_equipment_type=None):
+            """Recursively traverse all connected_nodes to count availability.
+            Only count instances that match the parent equipment type."""
+            if visited is None:
+                visited = set()
+            
+            # Use node ID to avoid double-counting
+            node_id = item.get("props", {}).get("id")
+            if node_id and node_id in visited:
+                return {"total": 0, "available": 0, "unavailable": 0}
+            if node_id:
+                visited.add(node_id)
+            
+            counts = {"total": 0, "available": 0, "unavailable": 0}
+            
+            # Determine the equipment type for this item
+            current_equipment_type = parent_equipment_type
+            item_labels = item.get("labels", [])
+            for label in item_labels:
+                if label in equipment_types:
+                    current_equipment_type = label
+                    break
+            
+            # Count current item if it has availability
+            availability = item.get("props", {}).get("availability")
+            asset_kind = item.get("props", {}).get("assetKind")
+            
+            # Only count Instance nodes (not Type nodes) that match the queried equipment type
+            if asset_kind == "Instance":
+                # Check if this instance should be counted based on equipment type context
+                should_count = False
+                
+                if not equipment_types:
+                    # If no equipment type filter, count all instances
+                    should_count = True
+                else:
+                    # Check relationship type to determine if this instance belongs to the equipment type
+                    rel_type = item.get("rel_type", "")
+                    for eq_type in equipment_types:
+                        # Match relationship like HAS_DRILLING, HAS_MODEL from Drilling parent
+                        if f"HAS_{eq_type.upper()}" in rel_type or current_equipment_type == eq_type:
+                            should_count = True
+                            break
+                
+                if should_count:
+                    counts["total"] += 1
+                    if availability == "True":
+                        counts["available"] += 1
+                    elif availability == "False":
+                        counts["unavailable"] += 1
+            
+            # Recursively process all connected_nodes, passing the equipment type context
+            for node in item.get("connected_nodes", []):
+                sub_counts = count_nodes_recursive(node, visited, current_equipment_type)
+                counts["total"] += sub_counts["total"]
+                counts["available"] += sub_counts["available"]
+                counts["unavailable"] += sub_counts["unavailable"]
+            
+            return counts
+        
+        # Count all nodes recursively across all results
+        all_counts = {"total": 0, "available": 0, "unavailable": 0}
+        for item in matched_results:
+            # Detect equipment type from this top-level item
+            item_equipment_type = None
+            for label in item.get("labels", []):
+                if label in equipment_types:
+                    item_equipment_type = label
+                    break
+            
+            # Pass the equipment type to the recursive function
+            item_counts = count_nodes_recursive(item, None, item_equipment_type)
+            all_counts["total"] += item_counts["total"]
+            all_counts["available"] += item_counts["available"]
+            all_counts["unavailable"] += item_counts["unavailable"]
 
         # Create a summary of the results with essential information
         summary = {
             "total_results": len(matched_results),
-            "total_models": sum(len(item.get("connected_models", [])) for item in matched_results),
-            "available_models": sum(
-                sum(1 for model in item.get("connected_models", []) 
-                    if model.get("availability") == "True")
-                for item in matched_results
-            ),
-            "unavailable_models": sum(
-                sum(1 for model in item.get("connected_models", []) 
-                    if model.get("availability") == "False")
-                for item in matched_results
-            ),
-            "model_types": {item.get("name"): len(item.get("connected_models", [])) for item in matched_results},
-            "available_by_type": {
-                item.get("name"): sum(1 for model in item.get("connected_models", []) 
-                                    if model.get("availability") == "True")
-                for item in matched_results
-            },
-            "unavailable_by_type": {
-                item.get("name"): sum(1 for model in item.get("connected_models", []) 
-                                    if model.get("availability") == "False")
-                for item in matched_results
-            }
+            "total_instance_nodes": all_counts["total"],
+            "available_nodes": all_counts["available"],
+            "unavailable_nodes": all_counts["unavailable"]
         }
         
-        # Limit the number of models in the results to avoid overloading Gemini
-        for item in matched_results:
-            # Count models before truncating
-            total_models = len(item.get("connected_models", []))
-            available_models = sum(1 for model in item.get("connected_models", []) if model.get("availability") == "True")
-            unavailable_models = total_models - available_models
-            
-            # Keep only a sample of models (first 5) to avoid overwhelming Gemini
-            if "connected_models" in item and len(item["connected_models"]) > 5:
-                item["connected_models"] = item["connected_models"][:5]
-                # Add a note about truncation
-                item["connected_models_note"] = f"Showing 5 of {total_models} models ({available_models} available, {unavailable_models} unavailable)"
+        # NOTE: For counting queries, the LLM should use the summary above which contains
+        # accurate recursive counts. The connected_nodes in results are for reference only.
+        # Truncation logic removed to ensure data integrity for counting operations.
         
         # Return both the summary and the truncated results
         return summary, matched_results
@@ -1405,6 +2707,71 @@ def preprocess_results_for_gemini(matched_results, query_text):
         
     return summary, matched_results
 
+
+# ============================================================================
+# CYPHER QUERY ENDPOINT (for MCP Server)
+# ============================================================================
+
+@app.route('/cypher', methods=['POST'])
+@cross_origin()
+def execute_cypher():
+    """
+    Execute arbitrary Cypher queries on the Neo4j database.
+    
+    Used by MCP server tools like update_availability.
+    
+    Request body:
+        {
+            "query": "MATCH (n:Asset) RETURN n LIMIT 10",
+            "params": {"param1": "value1", ...}  // optional
+        }
+    
+    Returns:
+        JSON array of results, where each result is a dictionary of the returned values.
+    """
+    try:
+        data = request.json
+        if not data:
+            return jsonify({"error": "Request body must be JSON"}), 400
+        
+        cypher_query = data.get('query', '')
+        params = data.get('params', {})
+        
+        if not cypher_query:
+            return jsonify({"error": "Query is required"}), 400
+        
+        logger.info(f"Executing Cypher query: {cypher_query}")
+        logger.info(f"With params: {params}")
+        
+        # Execute the query using Neo4j driver
+        with driver.session() as session:
+            result = session.run(cypher_query, **params)
+            
+            # Convert results to list of dictionaries
+            records = []
+            for record in result:
+                record_dict = {}
+                for key in record.keys():
+                    value = record[key]
+                    # Convert Neo4j nodes/relationships to dictionaries
+                    if hasattr(value, '__dict__'):
+                        record_dict[key] = dict(value)
+                    else:
+                        record_dict[key] = value
+                records.append(record_dict)
+        
+        logger.info(f"Cypher query returned {len(records)} records")
+        return jsonify(records), 200
+        
+    except Exception as e:
+        error_msg = f"Cypher query error: {str(e)}"
+        logger.error(error_msg)
+        return jsonify({"error": error_msg}), 500
+
+
 if __name__ == '__main__':
     # Run the Flask app
-    app.run(debug=True, port=5001)
+    # use_reloader=False prevents constant restarts when files change
+    app.run(debug=True, port=5001, use_reloader=False)
+
+

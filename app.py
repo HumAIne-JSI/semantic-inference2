@@ -16,6 +16,83 @@ API_HOST = "http://127.0.0.1:5001"
 file_upload_task_id = None
 embedding_task_id = None
 
+
+#MCP_SERVER = "http://localhost:5002"
+
+
+# import httpx
+
+# async def call_fastapi_mcp(machine: str, status: str):
+#     async with httpx.AsyncClient() as client:
+#         response = await client.post("http://localhost:9090/update_availability", json={
+#             "machine": machine,
+#             "status": status
+#         })
+#         if response.status_code != 200:
+#             return f"❌ Error: {response.json().get('detail', 'Unknown error')}"
+#         return response.json()["message"]
+
+
+# import ollama
+
+# async def detect_intent_and_extract(query: str) -> dict:
+#     """Use local AI to detect intent and extract machine name and availability status"""
+    
+#     prompt = f'''
+# You classify queries and extract info. Always return a JSON object like this:
+
+# {{"intent": "...", "machines": "[...]", "status": "..."}}
+
+# Rules:
+# - If the user wants to change a machine’s availability:
+#   → intent = "change_availability"
+#   → machine = list of names (like ["Machine #3", "Conveyor A"])
+#   → status = "True" (online/up) or "False" (offline/down)
+
+# - If the user asks for a count (like "how many machines..."):
+#   → intent = "other"
+#   → machine = ""
+#   → status = "counting"
+
+# - For anything else:
+#   → intent = "other"
+#   → machine = ""
+#   → status = ""
+
+# Examples:
+# "make machine 5 offline" → {{"intent": "change_availability", "machines": "["Machine #5"]", "status": "False"}}
+# "make machine 5 and 10 available" → {{"intent": "change_availability", "machines": "["Machine #5", "Machine #10"]", "status": "True"}}
+# "turn on conveyor A" → {{"intent": "change_availability", "machines": "["Conveyor A"]", "status": "True"}}
+# "how many drilling machines are online?" → {{"intent": "other", "machines": "", "status": "counting"}}
+# "name all drilling machines" → {{"intent": "other", "machines": "", "status": ""}}
+
+# Now process this:
+# "{query}"
+# '''
+
+
+
+#     try:
+#         response = ollama.chat(
+#             model='llama3.2:3b',  # Use a small, fast model
+#             messages=[{'role': 'user', 'content': prompt}],
+#             options={'temperature': 0.1}  # Low temperature for consistent extraction
+#         )
+#         print(prompt)
+#         print(response)
+#         # Parse the JSON response
+#         import json
+#         result = json.loads(response['message']['content'].strip())
+#         return result
+        
+#     except Exception as e:
+#         print(f"Error with local AI: {e}")
+#         # Fallback to simple keyword detection
+#         content_lower = query.lower()
+#         if any(word in content_lower for word in ['machine', 'available', 'unavailable', 'offline', 'online', 'down', 'up']):
+#             return {"intent": "change_availability", "machine": "", "status": ""}
+#         return {"intent": "other", "machine": "", "status": ""}
+
 # Helper functions
 async def check_progress(task_id, message):
     """Poll progress endpoint and update a message's progress bar"""
@@ -84,7 +161,7 @@ async def start():
                 id="graph_format",
                 label="Knowledge Graph Format",
                 values=["csv", "aas", "rdf"],
-                initial_value="rdf"
+                initial_value="aas"
             ),
             Select(
                 id="kg_action",
@@ -96,7 +173,7 @@ async def start():
     ).send()
     
     # Store initial settings in session
-    cl.user_session.set("graph_format", "rdf")
+    cl.user_session.set("graph_format", "aas")
     cl.user_session.set("kg_action", "none")
     
     # Welcome message with command help
@@ -112,7 +189,7 @@ async def start():
 async def on_settings_update(settings):
     """Handle settings changes including format selection and actions"""
     # Get current format from session
-    current_format = cl.user_session.get("graph_format", "rdf")
+    current_format = cl.user_session.get("graph_format", "aas")
     
     # Handle graph format change only if it's different
     new_format = settings.get("graph_format")
@@ -167,6 +244,58 @@ async def on_message(message: cl.Message):
     """Handle user messages, including special commands"""
     query = message.content.strip()
     
+    ################    MCP
+    # content = message.content.lower()
+
+    # if "make machine" in content:
+    #     # Extract machine name and status from the message
+    #     parts = content.split()
+    #     machine_idx = parts.index("machine") + 1
+    #     if machine_idx < len(parts):
+    #         machine = f'Machine #{parts[machine_idx].replace("#", " #").title()}'  # Handle "Machine #10" format
+    #         print(f"Machine: {machine}")
+    #         # Determine status based on available/unavailable keywords
+    #         if "unavailable" in content:
+    #             status = "False"
+    #         elif "available" in content:
+    #             status = "True"
+    #         else:
+    #             await cl.Message(content="Please specify 'available' or 'unavailable'").send()
+    #             return
+                
+    #         result = await call_fastapi_mcp(machine, status)
+    #         await cl.Message(content=result).send()
+    #     else:
+    #         await cl.Message(content="Please specify a machine name").send()
+    # else:
+    #     await cl.Message(content="🧠 No control intent detected. Try asking a question.").send()
+
+    ##################
+    # ai_result = await detect_intent_and_extract(query)
+    # print(f"AI Result: {ai_result}")
+    # if ai_result["intent"] == "change_availability":
+    #     machines = list(ai_result.get("machines", ""))#.strip()
+    #     status = ai_result.get("status", "").strip()
+        
+    #     print(f"Detected machines: {machines}, Status: {status}")
+    #     for machine in machines:
+    #         machine = machine.strip()  # Normalize machine name
+    #         if not machine or not status:
+    #             await cl.Message(content="Could not identify the machine name or desired status. Please be more specific.").send()
+    #             return
+                
+    #         #try:
+    #         print(f"Machine: {machine}, Status: {status}")
+    #         result = await call_fastapi_mcp(machine, status)
+    #         await cl.Message(content=result).send()
+    #         print(f"Result: {result}")
+            #except Exception as e:
+            #    print(e)
+                #await cl.Message(content=f"Error updating machine availability: {str(e)}").send()
+            #return
+    ##################
+
+
     # Handle special commands
     if query == "/delete-kg":
         await delete_knowledge_graph()
@@ -204,7 +333,7 @@ async def on_message(message: cl.Message):
         async with client.stream(
             "POST",
             f"{API_HOST}/semantic-search",
-            json={"query": query_obj, "n": 10},
+            json={"query": query_obj, "n": 11},#, "intent": ai_result},
             headers={"Accept": "text/event-stream"},
             timeout=60
         ) as response:
