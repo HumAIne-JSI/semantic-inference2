@@ -5,11 +5,13 @@ services:
   neo4j:
     image: neo4j:5.15-community
     container_name: rag-neo4j
-    ports:
-      - "7474:7474"  # HTTP
-      - "7687:7687"  # Bolt
+    # Keep Neo4j private by default.
+    # Uncomment ONLY for internal admin access from trusted company IPs.
+    # ports:
+    #   - "7474:7474"  # HTTP
+    #   - "7687:7687"  # Bolt
     environment:
-      - NEO4J_AUTH=neo4j/your_password_here  # Change this!
+      - NEO4J_AUTH=${NEO4J_AUTH}
       - NEO4J_PLUGINS=["apoc"]
       - NEO4J_apoc_export_file_enabled=true
       - NEO4J_apoc_import_file_enabled=true
@@ -39,10 +41,12 @@ services:
     ports:
       - "5001:5001"
     environment:
-      - NEO4J_URI=bolt://neo4j:7687
-      - NEO4J_USER=neo4j
-      - NEO4J_PASSWORD=your_password_here  # Change this!
-      - GEMINI_API_KEY=${GEMINI_API_KEY}  # Set in .env file
+      - NEO4J_URI=${NEO4J_URI:-bolt://neo4j:7687}
+      - NEO4J_USER=${NEO4J_USER:-neo4j}
+      - NEO4J_PASSWORD=${NEO4J_PASSWORD}
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
       - FLASK_ENV=production
       - PYTHONUNBUFFERED=1
     volumes:

@@ -10,7 +10,8 @@ from chainlit.action import Action
 import pandas as pd
 
 # Server configuration
-API_HOST = "http://127.0.0.1:5001"
+# For deployment set API_HOST, e.g. https://api.yourdomain.com
+API_HOST = os.getenv("API_HOST", "http://127.0.0.1:5001")
 
 # Global variables for tracking progress
 file_upload_task_id = None
