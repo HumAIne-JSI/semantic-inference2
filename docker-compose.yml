@@ -5,11 +5,10 @@ services:
   neo4j:
     image: neo4j:5.15-community
     container_name: rag-neo4j
-    # Keep Neo4j private by default.
-    # Uncomment ONLY for internal admin access from trusted company IPs.
-    # ports:
-    #   - "7474:7474"  # HTTP
-    #   - "7687:7687"  # Bolt
+    # Keep Neo4j non-public: bind only to internal interface (IJS network).
+    # Set IJS_INTERNAL_BIND_IP in .env to your server's internal IJS IP.
+    ports:
+      - "${IJS_INTERNAL_BIND_IP:-127.0.0.1}:5009:7687"  # Bolt (internal only)
     environment:
       - NEO4J_AUTH=${NEO4J_AUTH}
       - NEO4J_PLUGINS=["apoc"]
@@ -39,7 +38,7 @@ services:
       dockerfile: Dockerfile
     container_name: rag-api
     ports:
-      - "5001:5001"
+      - "5008:5001"
     environment:
       - NEO4J_URI=${NEO4J_URI:-bolt://neo4j:7687}
       - NEO4J_USER=${NEO4J_USER:-neo4j}
@@ -64,6 +63,25 @@ services:
       timeout: 10s
       retries: 3
       start_period: 40s
+
+  # Chainlit Frontend
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: rag-frontend
+    command: ["chainlit", "run", "app.py", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "5007:8000"
+    environment:
+      - API_HOST=http://api:5001
+      - PYTHONUNBUFFERED=1
+    depends_on:
+      api:
+        condition: service_healthy
+    networks:
+      - rag-network
+    restart: unless-stopped
 
 volumes:
   neo4j_data:

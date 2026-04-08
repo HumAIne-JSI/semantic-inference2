@@ -19,8 +19,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application files
 COPY semantic_search_api.py .
+COPY app.py .
 COPY ai_kg_constructor.py .
 COPY ai_kg_integration.py .
+COPY chainlit.md .
+COPY README.md .
 COPY *.json .
 COPY *.txt .
 COPY *.yaml .
