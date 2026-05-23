@@ -1,5 +1,5 @@
-# Use Python 3.12 as base image
-FROM python:3.12-slim
+# Use Python 3.11 for broader package wheel compatibility in deployment
+FROM python:3.11-slim
 
 # Set working directory
 WORKDIR /app
@@ -18,11 +18,9 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application files
-COPY semantic_search_api.py .
-COPY app.py .
-COPY ai_kg_constructor.py .
-COPY ai_kg_integration.py .
-COPY chainlit.md .
+# Copy all Python modules to avoid missing-import/runtime issues
+# and to prevent build failures when optional files are absent.
+COPY *.py .
 COPY README.md .
 COPY *.json .
 COPY *.txt .

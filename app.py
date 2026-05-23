@@ -6,7 +6,6 @@ from typing import List, Dict, Any
 import httpx
 import chainlit as cl
 from chainlit.input_widget import Select, Slider, Switch, TextInput
-from chainlit.action import Action
 import pandas as pd
 
 # Server configuration

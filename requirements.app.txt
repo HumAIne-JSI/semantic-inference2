@@ -1,0 +1,5 @@
+# Frontend runtime
+chainlit==1.0.0
+pydantic<2.12
+httpx==0.24.1
+pandas==2.1.3

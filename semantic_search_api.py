@@ -237,10 +237,11 @@ def generate_structured_cypher_query(schema: dict, similarity_threshold: float =
     
     # Combine all return fields
     all_returns = return_fields + collect_parts
+    return_clause = ",\n    ".join(all_returns)
     
     # Build the complete query
     complete_query = "\n".join(query_parts) + "\n" + "\n".join(optional_matches) + "\n\n" + \
-                    f"RETURN\n    {',\\n    '.join(all_returns)}\n" + \
+                    f"RETURN\n    {return_clause}\n" + \
                     f"ORDER BY similarity DESC\n" + \
                     f"LIMIT $n"
     
@@ -384,16 +385,30 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 # AI Provider Configuration
-AI_PROVIDER = os.getenv("AI_PROVIDER", "openai")  # Options: "gemini" or "openai"
+AI_PROVIDER = os.getenv("AI_PROVIDER", "openai")  # Options: "gemini", "openai", or "openrouter"
 logger.info(f"AI Provider configured: {AI_PROVIDER}")
 
 # Set up environment variables for API keys
-os.environ["GOOGLE_API_KEY"] = "your-api-key"
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "your-api-key")
+# Prefer GEMINI_API_KEY, fall back to GOOGLE_API_KEY for compatibility.
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+if GEMINI_API_KEY:
+    os.environ["GOOGLE_API_KEY"] = GEMINI_API_KEY
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
+OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
+OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "openai/gpt-4o-mini")
+OPENROUTER_SITE_URL = os.getenv("OPENROUTER_SITE_URL", "http://localhost")
+OPENROUTER_APP_NAME = os.getenv("OPENROUTER_APP_NAME", "rag-semantic-inference")
 
 # Configure AI providers
-genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
+if os.getenv("GOOGLE_API_KEY"):
+    genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
+else:
+    logger.warning("Gemini API key not provided - Gemini provider unavailable")
 openai_client = None
+openrouter_client = None
 
 if OPENAI_API_KEY and OPENAI_VERSION:
     try:
@@ -412,15 +427,42 @@ if OPENAI_API_KEY and OPENAI_VERSION:
 elif not OPENAI_API_KEY:
     logger.info("OpenAI API key not provided - OpenAI provider unavailable")
 
-# Neo4j connection setup (replace with your connection details)
-uri = "neo4j://localhost:7687"
-username = "neo4j"
-password = "your-neo4j-password"
+if OPENROUTER_API_KEY and OPENAI_VERSION:
+    try:
+        if OPENAI_VERSION == "new":
+            # OpenRouter uses OpenAI-compatible API and requires openai >= 1.0.0
+            openrouter_client = OpenAI(
+                api_key=OPENROUTER_API_KEY,
+                base_url=OPENROUTER_BASE_URL
+            )
+            logger.info("OpenRouter client initialized successfully (via OpenAI-compatible API)")
+        else:
+            logger.warning("OpenRouter requires openai >= 1.0.0. Please upgrade the openai package.")
+    except Exception as e:
+        logger.warning(f"Failed to initialize OpenRouter: {e}")
+        openrouter_client = None
+elif not OPENROUTER_API_KEY:
+    logger.info("OpenRouter API key not provided - OpenRouter provider unavailable")
+
+# Neo4j connection setup (configured via environment variables)
+uri = os.getenv("NEO4J_URI", "neo4j://localhost:7687")
+username = os.getenv("NEO4J_USER", "neo4j")
+password = os.getenv("NEO4J_PASSWORD", "")
+
+if not password:
+    logger.warning("NEO4J_PASSWORD is empty. Set it via environment variables for production.")
+
 driver = GraphDatabase.driver(uri, auth=(username, password))
 graph = Graph(uri, auth=(username, password))
 
 # Configure neomodel connection (used by /semantic-search). Neomodel expects bolt:// scheme.
-neomodel_config.DATABASE_URL = f"bolt://{username}:{password}@localhost:7687"
+bolt_uri = uri.replace("neo4j://", "bolt://", 1)
+if bolt_uri.startswith("bolt://"):
+    bolt_host = bolt_uri[len("bolt://"):]
+    neomodel_config.DATABASE_URL = f"bolt://{username}:{password}@{bolt_host}"
+else:
+    # Fallback for any unexpected URI format.
+    neomodel_config.DATABASE_URL = f"bolt://{username}:{password}@localhost:7687"
 
 # Initialize Flask app
 app = Flask(__name__)
@@ -448,7 +490,7 @@ graph_format = "aas"
 
 def generate_ai_response(prompt: str, stream: bool = True, provider: str = None):
     """
-    Universal AI response generator that works with both Gemini and OpenAI (both old and new versions).
+    Universal AI response generator that works with Gemini, OpenAI, and OpenRouter.
     
     Args:
         prompt: The prompt to send to the AI
@@ -459,7 +501,7 @@ def generate_ai_response(prompt: str, stream: bool = True, provider: str = None)
         For streaming: yields chunks with .text or .choices[0].delta.content
         For non-streaming: returns complete response text
     """
-    global AI_PROVIDER, openai_client, OPENAI_VERSION
+    global AI_PROVIDER, openai_client, openrouter_client, OPENAI_VERSION
     
     # Use override provider if specified, otherwise use global
     current_provider = provider if provider else AI_PROVIDER
@@ -473,7 +515,7 @@ def generate_ai_response(prompt: str, stream: bool = True, provider: str = None)
             if OPENAI_VERSION == "new":
                 # OpenAI >= 1.0.0 (new client-based API)
                 response = openai_client.chat.completions.create(
-                    model="gpt-4o",  # or "gpt-4o-mini" for faster/cheaper
+                    model=OPENAI_MODEL,
                     messages=[{"role": "user", "content": prompt}],
                     stream=stream,
                     temperature=0.1
@@ -499,6 +541,29 @@ def generate_ai_response(prompt: str, stream: bool = True, provider: str = None)
                     return response['choices'][0]['message']['content']
             else:
                 raise ValueError("OpenAI version not detected properly")
+
+        elif current_provider.lower() == "openrouter":
+            if not openrouter_client:
+                raise ValueError("OpenRouter client not initialized. Please set OPENROUTER_API_KEY environment variable.")
+
+            if OPENAI_VERSION != "new":
+                raise ValueError("OpenRouter requires openai >= 1.0.0")
+
+            response = openrouter_client.chat.completions.create(
+                model=OPENROUTER_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                stream=stream,
+                temperature=0.1,
+                extra_headers={
+                    "HTTP-Referer": OPENROUTER_SITE_URL,
+                    "X-Title": OPENROUTER_APP_NAME,
+                },
+            )
+
+            if stream:
+                return response
+            else:
+                return response.choices[0].message.content
         
         else:  # Default to Gemini
             model = genai.GenerativeModel("gemini-2.0-flash")
@@ -521,17 +586,17 @@ def generate_ai_response(prompt: str, stream: bool = True, provider: str = None)
 @app.route('/set-ai-provider', methods=['POST'])
 @cross_origin()
 def set_ai_provider():
-    """API endpoint to switch between AI providers (gemini/openai)."""
+    """API endpoint to switch between AI providers (gemini/openai/openrouter)."""
     global AI_PROVIDER
-    
+
     try:
-        data = request.json
+        data = request.json or {}
         provider = data.get('provider', 'gemini').lower()
         
-        if provider not in ['gemini', 'openai']:
+        if provider not in ['gemini', 'openai', 'openrouter']:
             return jsonify({
                 "status": "error",
-                "message": "Invalid provider. Choose 'gemini' or 'openai'"
+                "message": "Invalid provider. Choose 'gemini', 'openai', or 'openrouter'"
             }), 400
         
         # Check if OpenAI is available when switching to it
@@ -539,6 +604,12 @@ def set_ai_provider():
             return jsonify({
                 "status": "error",
                 "message": "OpenAI client not available. Please set OPENAI_API_KEY environment variable."
+            }), 400
+
+        if provider == 'openrouter' and not openrouter_client:
+            return jsonify({
+                "status": "error",
+                "message": "OpenRouter client not available. Please set OPENROUTER_API_KEY environment variable."
             }), 400
         
         AI_PROVIDER = provider
@@ -554,14 +625,21 @@ def set_ai_provider():
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
+@app.route('/health', methods=['GET'])
+def health():
+    """Simple health endpoint for Docker/K8s checks."""
+    return jsonify({"status": "ok"}), 200
+
+
 @app.route('/get-ai-provider', methods=['GET'])
 @cross_origin()
 def get_ai_provider():
     """Get current AI provider and available providers."""
     return jsonify({
         "current_provider": AI_PROVIDER,
-        "available_providers": ["gemini", "openai"],
-        "openai_available": openai_client is not None
+        "available_providers": ["gemini", "openai", "openrouter"],
+        "openai_available": openai_client is not None,
+        "openrouter_available": openrouter_client is not None
     }), 200
 
 
@@ -2772,6 +2850,10 @@ def execute_cypher():
 if __name__ == '__main__':
     # Run the Flask app
     # use_reloader=False prevents constant restarts when files change
-    app.run(debug=True, port=5001, use_reloader=False)
+    host = os.getenv("FLASK_HOST", "0.0.0.0")
+    port = int(os.getenv("FLASK_PORT", "5001"))
+    debug = os.getenv("FLASK_DEBUG", "False").lower() in {"1", "true", "yes", "on"}
+
+    app.run(host=host, port=port, debug=debug, use_reloader=False)
 
 
